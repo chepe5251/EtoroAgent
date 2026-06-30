@@ -1,7 +1,7 @@
 """
 ScreeningAgent — two-stage funnel over the full symbol universe.
 
-Stage 1a (deterministic): pandas-ta indicators on daily candles.
+Stage 1a (deterministic): pure-Python indicators on daily candles.
   Filter criteria (any ONE passes):
     - RSI(14) < 35 (oversold) or > 65 (overbought)
     - EMA20/EMA50 crossover in the last 3 days
@@ -22,14 +22,9 @@ import os
 from dataclasses import dataclass, field
 from typing import Optional, TYPE_CHECKING
 
-try:
-    import pandas as pd
-    import pandas_ta as ta  # type: ignore
-    _HAS_TA = True
-except ImportError:
-    _HAS_TA = False
-
 from openai import AsyncOpenAI
+
+from src.tools.technical import rsi as _rsi, ema as _ema, atr as _atr, relative_volume as _rvol
 
 if TYPE_CHECKING:
     from src.core.etoro_client import EtoroClient
@@ -123,50 +118,39 @@ class ScreeningAgent:
         return out
 
     def _compute(self, symbol: str, candles: list[dict]) -> Optional[ScreeningResult]:
-        if not _HAS_TA:
-            # Without pandas-ta, pass everything through to LLM stage
-            return ScreeningResult(symbol=symbol, score_tags=["no_ta_lib"])
-
         if len(candles) < 30:
             return None
 
         try:
-            df = pd.DataFrame([{
-                "open":   float(c.get("open",   c.get("o", 0))),
-                "high":   float(c.get("high",   c.get("h", 0))),
-                "low":    float(c.get("low",    c.get("l", 0))),
-                "close":  float(c.get("close",  c.get("c", 0))),
-                "volume": float(c.get("volume", c.get("v", 0))),
-            } for c in candles])
+            closes  = [float(c.get("close",  c.get("c", 0))) for c in candles]
+            highs   = [float(c.get("high",   c.get("h", 0))) for c in candles]
+            lows    = [float(c.get("low",    c.get("l", 0))) for c in candles]
+            volumes = [float(c.get("volume", c.get("v", 0))) for c in candles]
 
-            rsi_s   = ta.rsi(df["close"], length=14)
-            ema20_s = ta.ema(df["close"], length=20)
-            ema50_s = ta.ema(df["close"], length=50)
-            atr_s   = ta.atr(df["high"], df["low"], df["close"], length=14)
+            last_rsi   = _rsi(closes, 14)
+            last_atr   = _atr(highs, lows, closes, 14)
+            last_rvol  = _rvol(volumes, 20)
 
-            df["vol20"] = df["volume"].rolling(20).mean()
-            df["rel_vol"] = df["volume"] / df["vol20"].replace(0, float("nan"))
+            ema20_series = _ema(closes, 20)
+            ema50_series = _ema(closes, 50)
 
-            last_rsi    = float(rsi_s.iloc[-1])   if rsi_s.notna().any()   else None
-            last_ema20  = float(ema20_s.iloc[-1]) if ema20_s.notna().any() else None
-            last_ema50  = float(ema50_s.iloc[-1]) if ema50_s.notna().any() else None
-            last_atr    = float(atr_s.iloc[-1])   if atr_s.notna().any()   else None
-            last_rvol   = float(df["rel_vol"].iloc[-1]) if pd.notna(df["rel_vol"].iloc[-1]) else None
+            last_ema20 = ema20_series[-1] if ema20_series else None
+            last_ema50 = ema50_series[-1] if ema50_series else None
 
-            # EMA cross detection over last N candles
+            # EMA cross detection over last N candles.
+            # Both series end at the same (latest) date; align by taking the tail.
             ema_cross = False
-            for i in range(-self._ema_cross_days, 0):
-                try:
-                    prev_e20 = float(ema20_s.iloc[i - 1])
-                    prev_e50 = float(ema50_s.iloc[i - 1])
-                    curr_e20 = float(ema20_s.iloc[i])
-                    curr_e50 = float(ema50_s.iloc[i])
+            if ema20_series and ema50_series:
+                n = self._ema_cross_days
+                tail20 = ema20_series[-(n + 1):]
+                tail50 = ema50_series[-(n + 1):]
+                for i in range(1, min(len(tail20), len(tail50))):
+                    prev_e20, curr_e20 = tail20[i - 1], tail20[i]
+                    prev_e50, curr_e50 = tail50[i - 1], tail50[i]
                     if (prev_e20 < prev_e50 and curr_e20 >= curr_e50) or \
                        (prev_e20 > prev_e50 and curr_e20 <= curr_e50):
                         ema_cross = True
                         break
-                except (IndexError, ValueError):
-                    pass
 
             tags: list[str] = []
             if last_rsi is not None:
@@ -176,7 +160,7 @@ class ScreeningAgent:
                     tags.append("rsi_overbought")
             if ema_cross:
                 tags.append("ema_cross")
-            if last_rvol and last_rvol > self._rel_vol:
+            if last_rvol is not None and last_rvol > self._rel_vol:
                 tags.append("high_volume")
 
             return ScreeningResult(

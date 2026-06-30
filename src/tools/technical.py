@@ -37,6 +37,9 @@ def rsi(closes: list[float], period: int = 14) -> Optional[float]:
         avg_gain = (avg_gain * (period - 1) + gains[i]) / period
         avg_loss = (avg_loss * (period - 1) + losses[i]) / period
 
+    if avg_gain == 0 and avg_loss == 0:
+        # No price movement at all — RSI is undefined (matches pandas-ta NaN behaviour)
+        return None
     if avg_loss == 0:
         return 100.0
     rs = avg_gain / avg_loss
