@@ -74,7 +74,7 @@ ASIA_STOCKS: list[str] = [
 CRYPTO: list[str] = [
     "BTC", "ETH", "BNB", "XRP", "SOL", "DOGE", "ADA", "AVAX",
     "DOT", "LINK", "LTC", "UNI", "ATOM", "XLM", "NEAR",
-    "BCH", "APT", "ARB", "OP", "MATIC",
+    "BCH", "APT", "ARB", "OP", "POL",
 ]
 
 REGION_SYMBOLS: dict[str, list[str]] = {

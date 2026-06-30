@@ -26,18 +26,18 @@ class RateLimiter:
         self._lock = asyncio.Lock()
 
     async def acquire(self):
-        async with self._lock:
-            now = time.monotonic()
-            while self._timestamps and now - self._timestamps[0] >= self.period:
-                self._timestamps.popleft()
-            if len(self._timestamps) >= self.max_calls:
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                while self._timestamps and now - self._timestamps[0] >= self.period:
+                    self._timestamps.popleft()
+                if len(self._timestamps) < self.max_calls:
+                    self._timestamps.append(time.monotonic())
+                    return
                 sleep_for = self.period - (now - self._timestamps[0])
-                if sleep_for > 0:
-                    logger.debug("Rate limit reached, sleeping %.2fs", sleep_for)
-                # Release lock while sleeping so other coroutines can check
-                self._timestamps.popleft()
-                self._timestamps.appendleft(time.monotonic() - self.period + sleep_for)
-            self._timestamps.append(time.monotonic())
+            if sleep_for > 0:
+                logger.debug("Rate limit reached, sleeping %.2fs", sleep_for)
+                await asyncio.sleep(sleep_for)
 
 
 class EtoroClient:

@@ -114,9 +114,10 @@ class NotificationAgent:
         )
 
     async def send_startup(self, mode: str, symbols: list[str]):
+        model = os.getenv("LLM_MODEL", "?")
         await self._send(
             f"🤖 <b>etoroAgent Started</b>\n"
             f"Mode: <code>{mode.upper()}</code>\n"
             f"Watching: {', '.join(symbols)}\n"
-            f"Engine: ReAct + Qwen2.5-7B-Instruct (LM Studio)"
+            f"Engine: ReAct + {model}"
         )

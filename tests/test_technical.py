@@ -32,8 +32,15 @@ def test_rsi_returns_none_on_insufficient_data():
 
 
 def test_rsi_constant_series():
-    # No change → 0 gains → RSI should be defined (0 losses → RS=inf → RSI=100)
+    # No price change at all → avg_gain=0 and avg_loss=0 → RS=0/0 (undefined) → None
     closes = [100.0] * 20
+    result = rsi(closes, 14)
+    assert result is None
+
+
+def test_rsi_no_losses():
+    # Pure uptrend → avg_loss=0 but avg_gain>0 → RS=inf → RSI=100
+    closes = [float(i) for i in range(1, 21)]
     result = rsi(closes, 14)
     assert result == pytest.approx(100.0)
 
