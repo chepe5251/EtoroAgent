@@ -82,8 +82,10 @@ CLOSE_POSITION_RESPONSE = {
 @pytest.fixture
 def mock_client():
     routes = {
-        "/api/v1/instruments/BTC/candles": (200, CANDLES_RESPONSE),
+        # New endpoint (Fase 0a): /market-data/instruments/history/candles
+        "/api/v1/market-data/instruments/history/candles": (200, CANDLES_RESPONSE),
         "/api/v1/rates": (200, RATES_RESPONSE),
+        # /instruments handles both get_instrument_id (filter) and is no longer the candles path
         "/api/v1/instruments": (200, INSTRUMENT_RESPONSE),
         "/api/v1/demo/balance": (200, BALANCE_RESPONSE),
         "/api/v1/demo/portfolio": (200, PORTFOLIO_RESPONSE),
@@ -101,7 +103,10 @@ def mock_client():
 
 @pytest.mark.asyncio
 async def test_get_candles(mock_client):
-    candles = await mock_client.get_candles("BTC", "M15", 2)
+    # Patch _cache_id so we don't hit the real universe_cache.json
+    from unittest.mock import patch
+    with patch("src.core.etoro_client._cache_id", return_value="42"):
+        candles = await mock_client.get_candles("BTC", "D1", 2)
     assert len(candles) == 2
     assert candles[0]["close"] == 50500
 
