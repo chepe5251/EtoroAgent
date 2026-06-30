@@ -8,3 +8,4 @@ universe_cache.json
 logs/
 *.log
 .DS_Store
+data/candles/
