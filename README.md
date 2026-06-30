@@ -1,30 +1,98 @@
 # etoroAgent
 
-Autonomous multi-agent trading system for eToro built with Python 3.11+, LiteLLM, and APScheduler.
+Autonomous swing-trading bot for eToro — Python 3.12, OpenAI-compatible LLM, MCP tools, APScheduler.
+
+**Trading horizon:** 5–20 days (daily candles).  
+**Universe:** ~150–200 instruments across US stocks, EU stocks, Asian ADRs, and major crypto.
+
+---
 
 ## Architecture
 
 ```
 main.py
-└── Orchestrator (APScheduler loop)
-    ├── MarketDataAgent   → fetches candles + computes RSI/MACD/EMA/BB/ATR
-    ├── SentimentAgent    → NewsAPI + Reddit → LLM sentiment score
-    ├── SignalAgent       → LLM decides BUY/SELL/HOLD per symbol
-    ├── DecisionAgent     → position sizing, max-positions, dedup
-    ├── RiskAgent         → daily loss limit, trailing stop adjustment
-    ├── ExecutionAgent    → calls eToro API to open/close positions
-    └── NotificationAgent → Telegram alerts
+└── Orchestrator (APScheduler)
+    │
+    ├── REASONING PLANE (LLM)
+    │   ├── ScreeningAgent           two-speed funnel (see below)
+    │   └── ResearchAgent            full ReAct loop per shortlisted symbol
+    │       ├── calls MCP tools (read-only)
+    │       └── produces TradingThesis (typed dataclass)
+    │
+    ├── EXECUTION PLANE (deterministic, no LLM)
+    │   ├── risk_gate.validate()     8 hard rules — blocks trade if any fails
+    │   ├── size_position()          ATR-based sizing, % of balance
+    │   └── ExecutionAgent           single HTTP call to eToro, state.save()
+    │
+    ├── REVIEW PLANE (LLM, 1×/day per position)
+    │   └── PositionReviewAgent      ReAct loop, verdict: EXIT / HOLD / TIGHTEN_STOP
+    │       └── hard exit at 20 days (no LLM — deterministic)
+    │
+    └── MAINTENANCE (deterministic)
+        ├── TrailingStopAgent        every 60 min — tighten stop, push to broker
+        └── NotificationAgent        Telegram (fire-and-forget)
 ```
 
-The LLM is used only in **SignalAgent** (trading signals) and **SentimentAgent** (news/Reddit scoring). All other agents are deterministic.
+### Two-speed screening funnel
+
+```
+Full universe (~150-200 symbols)
+    │
+    ▼  Stage 1a — deterministic (pandas-free, pure Python)
+       RSI(14) < 35 or > 65   OR   EMA20/50 cross (last 3 days)   OR   RelVol > 1.5×
+    │
+    ▼  Stage 1b — fast LLM (single call per batch of 8, no tools)
+       Model picks top 3 per batch
+    │
+    ▼  Shortlist  ≤ 15 symbols
+    │
+    ▼  ResearchAgent — full ReAct per symbol (MCP tools, up to 8 iterations)
+    │
+    ▼  TradingThesis → risk_gate → ExecutionAgent
+```
+
+### MCP tool servers (read-only, stdio)
+
+| Server | Tools provided |
+|---|---|
+| `etoro_server.py` | Candles, rates, instrument search |
+| `indicators_server.py` | RSI, EMA, MACD, ATR, Bollinger (via `src/tools/technical.py`) |
+| `finnhub_server.py` | Company news, earnings calendar |
+| `cryptopanic_server.py` | Crypto news sentiment |
+| `reddit_server.py` | WSB/stocks/crypto subreddit sentiment |
+
+### State persistence
+
+On every position open/close, `ProjectState.save()` writes `state.json` to disk.  
+On startup, `ProjectState.load()` restores state and then `_reconcile_open_positions()` calls `get_portfolio()` to sync with the live broker:
+
+- Positions closed externally (mobile app, web UI) are removed from state.
+- Positions opened externally (before last restart) are added.
+- Current rates are refreshed from the broker response.
+
+### Risk gate rules (all must pass)
+
+| # | Rule |
+|---|---|
+| 0 | `action == "hold"` → skip (no trade needed) |
+| 1 | `confidence ≥ MIN_SIGNAL_CONFIDENCE` (default 65%) |
+| 2 | `len(signals_used) ≥ MIN_SIGNALS_REQUIRED` (default 2) |
+| 3 | `len(reasoning) ≥ 50` chars |
+| 4 | No active daily-loss block |
+| 5 | `realized_loss + unrealized_loss < DAILY_LOSS_LIMIT_PCT` of balance |
+| 6 | `open_positions < MAX_OPEN_POSITIONS` (default 3) |
+| 7 | No duplicate symbol already open |
+| 8 | `5 ≤ horizon_days ≤ 20` |
+
+---
 
 ## Setup
 
 ### 1. Clone and create environment
 
 ```bash
-git clone <repo>
-cd etoroBot
+git clone git@github.com:chepe5251/EtoroAgent.git
+cd EtoroAgent
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
@@ -37,51 +105,46 @@ cp .env.example .env
 # Edit .env with your credentials
 ```
 
-| Variable | Description |
-|---|---|
-| `ETORO_MODE` | `demo` or `real` |
-| `ETORO_PUBLIC_API_KEY` | eToro API key (`x-api-key` header) |
-| `ETORO_USER_KEY` | eToro user key JWT (`x-user-key` header) |
-| `WATCH_SYMBOLS` | Comma-separated tickers: `BTC,ETH,AAPL,TSLA` |
-| `LLM_MODEL` | LiteLLM model string (see below) |
-| `LLM_BASE_URL` | Override for local models (LM Studio / ollama) |
-| `LLM_API_KEY` | API key for the LLM provider |
-| `DAILY_LOSS_LIMIT_PCT` | Block trading if daily loss exceeds this % of balance (default `3.0`) |
-| `MAX_POSITION_SIZE_PCT` | % of balance per trade (default `2.0`) |
-| `MAX_OPEN_POSITIONS` | Max simultaneous open positions (default `3`) |
-| `TELEGRAM_TOKEN` | BotFather token for notifications |
-| `TELEGRAM_CHAT_ID` | Target chat/group ID |
-| `NEWS_API_KEY` | newsapi.org key |
-| `REDDIT_CLIENT_ID` | Reddit app client ID |
-| `REDDIT_CLIENT_SECRET` | Reddit app secret |
+### 3. LLM configuration
 
-### 3. LLM configuration examples
+The bot uses the **OpenAI Python SDK** (`openai` package) pointing at any OpenAI-compatible endpoint.  
+There is **no LiteLLM** dependency — do not use LiteLLM model prefixes.
 
 ```bash
-# LM Studio (PC local con RTX 5060 Ti)  ← recomendado para uso local
-LLM_MODEL=lm_studio/qwen3-8b      # prefijo lm_studio/ + nombre del modelo en LM Studio
-LLM_BASE_URL=http://localhost:1234/v1
-LLM_API_KEY=lm-studio              # cualquier string, LM Studio no valida la key
+# LM Studio (local, recommended)
+LLM_MODEL=deepseek-coder-v2-lite-instruct   # exact model ID from /v1/models
+LLM_BASE_URL=http://192.168.100.216:1234/v1
+LLM_API_KEY=lm-studio                        # any non-empty string
 
-# Ollama (local)
-LLM_MODEL=ollama/qwen3:8b
-LLM_BASE_URL=http://localhost:11434
+# Ollama
+LLM_MODEL=qwen2.5-coder:7b
+LLM_BASE_URL=http://localhost:11434/v1
 LLM_API_KEY=ollama
 
 # OpenAI
 LLM_MODEL=gpt-4o
-LLM_BASE_URL=                      # dejar vacío
+LLM_BASE_URL=                                # leave empty (SDK default)
 LLM_API_KEY=sk-...
 
-# Anthropic
-LLM_MODEL=claude-opus-4-8
-LLM_BASE_URL=                      # dejar vacío
-LLM_API_KEY=sk-ant-...
+# Anthropic is NOT supported without adding LiteLLM as a dependency.
 ```
 
-> **Tip LM Studio:** el `LLM_MODEL` debe tener el prefijo `lm_studio/` seguido exactamente del identificador que LM Studio muestra en "Model Name" (p.ej. `lm_studio/qwen3-8b-instruct`). Si el modelo cambia, solo actualiza esta variable.
+> **LM Studio tip:** The `LLM_MODEL` value must match exactly the `"id"` field from `GET /v1/models`.
 
-## Running locally
+### 4. Universe discovery (recommended before first run)
+
+The static symbol lists in `src/config/universe.py` are best-guess tickers.  
+eToro's internal instrument names can differ. Run discovery once to validate:
+
+```bash
+python src/config/discovery.py --regions US,EU,ASIA,CRYPTO
+```
+
+This saves `universe_cache.json` (valid 7 days). Re-run with `--force` to refresh.
+
+---
+
+## Running
 
 ```bash
 # Demo mode (safe — no real money)
@@ -91,83 +154,197 @@ ETORO_MODE=demo python main.py
 ETORO_MODE=real python main.py
 ```
 
-Logs are written to `logs/etoroAgent.log` and stdout.
+Logs go to `logs/etoroAgent.log` and stdout.
 
-## Switching demo → real
-
-Edit your `.env` file:
-```
-ETORO_MODE=real
-```
-
-Then restart the agent. The client automatically routes execution endpoints to `/real/positions` instead of `/demo/positions`.
-
-## Running with Docker (VPS / Contabo)
+## Running with Docker
 
 ```bash
-# Build and start
 docker-compose up -d
-
-# View logs
 docker-compose logs -f etoro-agent
-
-# Stop
 docker-compose down
 ```
 
-Logs are persisted to `./logs/` on the host.
+---
+
+## Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `ETORO_MODE` | `demo` | `demo` or `real` |
+| `ETORO_PUBLIC_API_KEY` | *(required)* | `x-api-key` header |
+| `ETORO_USER_KEY` | *(required)* | `x-user-key` JWT header |
+| `WATCH_REGIONS` | `US,EU,ASIA,CRYPTO` | Regions to scan |
+| `LLM_MODEL` | `deepseek-coder-v2-lite-instruct` | Model ID for research + review |
+| `LLM_BASE_URL` | `http://localhost:1234/v1` | OpenAI-compatible endpoint |
+| `LLM_API_KEY` | `lm-studio` | API key (any string for local) |
+| `LLM_TEMPERATURE` | `0.3` | Sampling temperature |
+| `LLM_MAX_ITERATIONS` | `8` | Max ReAct iterations per symbol |
+| `SCREENING_LLM_MODEL` | `LLM_MODEL` | Model for Stage 1b fast filter |
+| `DAILY_LOSS_LIMIT_PCT` | `3.0` | Block trading beyond this % daily loss |
+| `MAX_POSITION_SIZE_PCT` | `2.0` | % of balance per position |
+| `MAX_OPEN_POSITIONS` | `3` | Max simultaneous positions |
+| `MIN_SIGNAL_CONFIDENCE` | `0.65` | Minimum thesis confidence |
+| `MIN_SIGNALS_REQUIRED` | `2` | Minimum MCP tools cited |
+| `SWING_MIN_HORIZON_DAYS` | `5` | Minimum `horizon_days` in thesis |
+| `SWING_MAX_HORIZON_DAYS` | `20` | Maximum `horizon_days` in thesis |
+| `SWING_HARD_EXIT_DAYS` | `20` | Force-close position after N days (no LLM) |
+| `SCREEN_RSI_OVERSOLD` | `35` | Stage 1a RSI oversold threshold |
+| `SCREEN_RSI_OVERBOUGHT` | `65` | Stage 1a RSI overbought threshold |
+| `SCREEN_REL_VOL` | `1.5` | Stage 1a relative volume multiplier |
+| `SCREEN_EMA_CROSS_DAYS` | `3` | Stage 1a look-back for EMA cross |
+| `REVIEW_MIN_CONFIDENCE` | `0.55` | Min confidence for position review verdict |
+| `TELEGRAM_TOKEN` | | BotFather token |
+| `TELEGRAM_CHAT_ID` | | Target chat/group ID |
+| `FINNHUB_API_KEY` | | finnhub.io free-tier key |
+| `CRYPTOPANIC_API_KEY` | | cryptopanic.com free-tier key |
+| `REDDIT_CLIENT_ID` | | Reddit app client ID |
+| `REDDIT_CLIENT_SECRET` | | Reddit app secret |
+| `REDDIT_USER_AGENT` | `etoroAgent/1.0` | Reddit OAuth user agent |
+
+---
+
+## Schedule
+
+| Job | When |
+|---|---|
+| US screening | 09:35 America/New_York (market open +5 min) |
+| EU screening | 09:05 Europe/Berlin |
+| ASIA screening | 09:05 Asia/Tokyo |
+| Crypto screening | Every 6 hours UTC |
+| Position review | 07:00 UTC daily |
+| Trailing stop adjustment | Every 60 minutes |
+| Daily P&L summary (Telegram) | 23:00 UTC |
+
+All equity schedules are skipped on market holidays via `pandas-market-calendars`.  
+If the library is not installed, equity markets are treated as **CLOSED** (fail-safe).
+
+---
 
 ## Running tests
 
 ```bash
-pip install pytest pytest-asyncio
-pytest tests/ -v
+pytest tests/ -q
 ```
 
-## Cycle schedule
+No network calls in tests. MCP servers and LLM are mocked.
 
-| Job | Interval |
-|---|---|
-| Main cycle (data → signal → execute) | Every 15 min (configurable) |
-| Trailing stop adjustment | Every 5 min (configurable) |
-| Daily P&L summary (Telegram) | 23:00 UTC |
-
-## Risk controls
-
-- **Daily loss limit**: if cumulative P&L drops below `-DAILY_LOSS_LIMIT_PCT %` of balance, all new trades are blocked until midnight UTC.
-- **Max open positions**: capped at `MAX_OPEN_POSITIONS` (default 3).
-- **No duplicate positions**: only one position per symbol at a time.
-- **Stop-loss**: initial stop = 1.5 × ATR(14); tightened automatically as price moves in your favour (trailing every 5 min).
-- **Confidence filter**: signals with confidence < 65% are discarded before reaching DecisionAgent.
+---
 
 ## Project structure
 
 ```
-etoroBot/
+EtoroAgent/
 ├── src/
 │   ├── agents/
-│   │   ├── market_data_agent.py   # OHLCV fetch + indicators
-│   │   ├── sentiment_agent.py     # news + Reddit → LLM score
-│   │   ├── signal_agent.py        # LLM → BUY/SELL/HOLD
-│   │   ├── decision_agent.py      # sizing + pre-validation
-│   │   ├── execution_agent.py     # eToro API calls
-│   │   ├── risk_agent.py          # daily loss + trailing stops
-│   │   └── notification_agent.py  # Telegram
+│   │   ├── screening_agent.py      Stage 1a (technical) + 1b (fast LLM)
+│   │   ├── research_agent.py       Full ReAct loop → TradingThesis
+│   │   ├── risk_gate.py            8 deterministic rules, no LLM
+│   │   ├── execution_agent.py      Single-shot order submission
+│   │   ├── position_review_agent.py Daily review + hard 20-day exit
+│   │   ├── trailing_stop_agent.py  Tighten stop + push to broker
+│   │   └── notification_agent.py   Telegram alerts
 │   ├── core/
-│   │   ├── etoro_client.py        # async HTTP + rate limiting + retry
-│   │   ├── state.py               # shared ProjectState dataclasses
-│   │   └── orchestrator.py        # APScheduler wiring
+│   │   ├── etoro_client.py         Async HTTP + rate limiter + idempotent writes
+│   │   ├── state.py                ProjectState + Position (save/load JSON)
+│   │   ├── orchestrator.py         APScheduler wiring + startup reconciliation
+│   │   ├── thesis.py               TradingThesis dataclass (LLM ↔ execution contract)
+│   │   └── market_calendar.py      Trading day check (fail-closed without mcal)
+│   ├── config/
+│   │   ├── universe.py             Static symbol lists + cache loader
+│   │   └── discovery.py            CLI to validate eToro instrument names
+│   ├── llm/
+│   │   └── react_runtime.py        ReAct loop driver (OpenAI SDK + DeepSeek token fallback)
+│   ├── mcp_clients/
+│   │   └── mcp_manager.py          Start/stop MCP servers, per-session asyncio.Lock
+│   ├── mcp_servers/
+│   │   ├── etoro_server.py
+│   │   ├── indicators_server.py
+│   │   ├── finnhub_server.py
+│   │   ├── cryptopanic_server.py
+│   │   └── reddit_server.py
 │   └── tools/
-│       ├── technical.py           # pure indicator functions
-│       └── sentiment.py           # news/reddit fetch helpers
+│       └── technical.py            Pure-Python RSI, EMA, MACD, ATR, BollingerBands
+├── skills/
+│   └── swing_trading.md            System prompt context for the ReAct loop
 ├── tests/
 │   ├── test_etoro_client.py
-│   ├── test_risk_agent.py
+│   ├── test_market_calendar.py
+│   ├── test_position_review.py
+│   ├── test_react_runtime.py
+│   ├── test_risk_gate.py
+│   ├── test_screening_agent.py
 │   └── test_technical.py
-├── logs/                          # auto-created
+├── logs/                           Auto-created at startup
+├── state.json                      Persisted position state (auto-managed)
+├── universe_cache.json             Instrument ID cache (auto-managed)
 ├── .env.example
 ├── docker-compose.yml
 ├── Dockerfile
 ├── requirements.txt
 └── main.py
+```
+
+---
+
+## ⚠️ Antes de operar en real (verificación manual obligatoria)
+
+Antes de cambiar a `ETORO_MODE=real`, validá los siguientes puntos **manualmente** en modo `demo` comparando contra la UI de eToro. El código tiene NOTEs en los lugares críticos.
+
+### 1. Campo `stopLoss` en `open_position()`
+
+`EtoroClient.open_position()` envía:
+```python
+"stopLoss": round(stop_loss_pct, 4)   # ← ¿% o precio absoluto o monto $?
+```
+
+**Qué verificar:** Abrí una posición demo con stop `stop_loss_pct = 2.0`.  
+Chequeá en la UI de eToro qué stop quedó asignado.  
+- Si la UI muestra `2.0` como porcentaje → el campo es correcto.  
+- Si la UI muestra un precio absoluto → tenés que convertir: `stop_price = entry_rate * (1 - stop_pct/100)`.  
+- Si la UI muestra un monto en dólares → calcular `stop_amount = amount_usd * stop_pct / 100`.
+
+### 2. Endpoint y payload de `update_stop_loss()`
+
+`TrailingStopAgent` llama a `EtoroClient.update_stop_loss()` que hace:
+```python
+PUT /{mode}/positions/{position_id}
+{"instrumentId": ..., "stopLoss": round(new_stop, 4)}
+```
+
+**Qué verificar:**
+- Que el endpoint `PUT /demo/positions/{id}` exista y acepte ese payload.
+- Que después de la llamada el stop en la UI refleje el nuevo valor.
+- Si el endpoint es diferente (ej. `PATCH`, o una URL distinta), actualizá `update_stop_loss()`.
+
+### 3. Campos del portfolio en `_reconcile_open_positions()`
+
+La reconciliación mapea campos del JSON de `GET /{mode}/portfolio`. Los nombres asumidos son:
+
+| Campo asumido | Alternativas comunes |
+|---|---|
+| `positionId` | `id` |
+| `instrumentName` | `ticker`, `symbol` |
+| `openRate` | `openPrice`, `rate` |
+| `openDateTime` | `openDate` |
+| `isBuy` | `direction` (1=buy/-1=sell) |
+| `amount` | `investmentAmount` |
+| `currentRate` | `rate` |
+| `stopLoss` | `stopLossRate` |
+
+**Qué verificar:** Logueá la respuesta raw de `get_portfolio()` en demo y confirmá que los nombres de campo coincidan. Si no coinciden, ajustá el mapping en `_reconcile_open_positions()`.
+
+### 4. Modo de prueba recomendado
+
+```bash
+# 1. Correr en demo durante al menos 1 ciclo completo
+ETORO_MODE=demo python main.py
+
+# 2. En los logs buscar:
+#    "Reconciliation complete"  → la reconciliación funcionó
+#    "position opened id=..."   → se abrió y guardó correctamente
+#    "Trailing stop: ..."       → el stop se ajustó y empujó al broker
+
+# 3. Verificar en la UI de eToro que los valores coincidan
+
+# 4. Solo entonces cambiar a ETORO_MODE=real
 ```
