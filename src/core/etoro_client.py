@@ -15,6 +15,39 @@ logger = logging.getLogger(__name__)
 
 BASE_URL = "https://public-api.etoro.com/api/v1"
 
+# Module-level alias so tests can patch via 'src.core.etoro_client._cache_id'
+from src.config.universe import get_instrument_id as _cache_id  # noqa: E402
+
+# ── Interval translation table ─────────────────────────────────────────────────
+# Source confirmed: api-portal.etoro.com / builders.etoro.com
+#   "OneDay" is confirmed for daily candles.
+#
+# NOTE (manual verification required):
+#   Sub-day intervals ("OneHour", "FifteenMinutes", etc.) are educated guesses
+#   based on common broker API naming conventions.  Verify the full list of
+#   accepted `interval` values by calling the endpoint with each candidate and
+#   checking for a 400/422 error.  An alternative is to inspect the Network tab
+#   in the eToro web app while loading a chart.
+_INTERVAL_MAP: dict[str, str] = {
+    # Our internal codes → eToro API values
+    "D1":  "OneDay",         # confirmed
+    "W1":  "OneWeek",        # NOTE: unverified — may be "Weekly" or unsupported
+    "H1":  "OneHour",        # NOTE: unverified
+    "H4":  "FourHours",      # NOTE: unverified
+    "M60": "OneHour",        # alias
+    "M15": "FifteenMinutes", # NOTE: unverified
+    "M5":  "FiveMinutes",    # NOTE: unverified
+    "M1":  "OneMinute",      # NOTE: unverified
+    # Pass-through if already in eToro format
+    "OneDay":          "OneDay",
+    "OneWeek":         "OneWeek",
+    "OneHour":         "OneHour",
+    "FourHours":       "FourHours",
+    "FifteenMinutes":  "FifteenMinutes",
+    "FiveMinutes":     "FiveMinutes",
+    "OneMinute":       "OneMinute",
+}
+
 
 class RateLimiter:
     """Token-bucket rate limiter tracked per sliding window."""
@@ -144,15 +177,75 @@ class EtoroClient:
     # ------------------------------------------------------------------
 
     async def get_candles(
-        self, symbol: str, interval: str = "M15", count: int = 100
+        self,
+        symbol: str,
+        interval: str = "D1",
+        count: int = 100,
+        direction: str = "asc",
     ) -> list[dict]:
+        """
+        Fetch OHLCV candles for a symbol using the real eToro market-data endpoint.
+
+        Endpoint: GET /market-data/instruments/history/candles
+        Params:   instrumentId (numeric), direction (asc|desc), interval, limit (≤1000)
+
+        The `symbol` string is resolved to a numeric instrumentId via the universe
+        cache first; if not cached, a live API call to /instruments is made.
+        Returns an empty list (and logs a warning) if instrumentId cannot be resolved.
+
+        Interval translation: "D1" → "OneDay" via _INTERVAL_MAP.
+        Unknown intervals are passed through unchanged (server will 400 if invalid).
+
+        NOTE — Pagination limit:
+          The eToro API accepts limit≤1000 per request (~4 trading years for daily).
+          A `from`/`to` date-range parameter is NOT documented in the public portal.
+          For 5-year (≈1260 bar) requests, this method is called with count=1000,
+          which may return less data than requested.  Verify in demo whether:
+            (a) a `from` or `startDate` param is accepted (would enable pagination),
+            (b) `direction=asc` reliably returns the oldest available bars,
+            (c) max historical depth (some brokers cap at 2-3 years for free tiers).
+          Until confirmed, data.fetch_symbol() warns when <_MIN_BARS_FOR_BACKTEST
+          are returned.
+
+        NOTE — Response field names:
+          Confirmed field mapping is unknown at writing time (no sandbox available).
+          _normalise_candle() in data.py attempts multiple key variants.  Verify the
+          actual JSON response in demo and update _ETORO_FIELD_MAP if needed.
+        """
+        # Translate interval code
+        etoro_interval = _INTERVAL_MAP.get(interval, interval)
+
+        # Resolve symbol → numeric instrumentId (cache first, then live API)
+        instrument_id: Optional[str] = _cache_id(symbol)
+        if instrument_id is None:
+            instrument_id = await self.get_instrument_id(symbol)
+        if instrument_id is None:
+            logger.warning(
+                "get_candles: cannot resolve instrumentId for %s — returning []", symbol
+            )
+            return []
+
         data = await self._request(
             "GET",
-            f"/instruments/{symbol}/candles",
+            "/market-data/instruments/history/candles",
             limiter=self._market_limiter,
-            params={"resolution": interval, "count": count},
+            params={
+                "instrumentId": instrument_id,
+                "direction": direction,
+                "interval": etoro_interval,
+                "limit": min(count, 1000),
+            },
         )
+
+        # Unwrap envelope: {"data": [...]} or bare list
         candles = data.get("data", data) if isinstance(data, dict) else data
+        if not isinstance(candles, list):
+            logger.warning(
+                "get_candles: unexpected response type %s for %s",
+                type(candles).__name__, symbol,
+            )
+            return []
+        logger.debug("get_candles: %s returned %d raw candles", symbol, len(candles))
         return candles
 
     async def get_rates(self, symbols: list[str]) -> dict[str, dict]:
