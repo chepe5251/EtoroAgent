@@ -28,6 +28,7 @@ def validate(
     thesis: TradingThesis,
     state: ProjectState,
     balance: float = 0.0,
+    unrealized_pnl: float = 0.0,
 ) -> tuple[bool, str]:
     """
     Validate a trading thesis against deterministic risk rules.
@@ -73,12 +74,15 @@ def validate(
     if state.is_risk_blocked:
         return False, f"daily loss block active: {state.risk_block_reason}"
 
-    # Rule 5: check daily loss limit (proactive — block before it triggers)
+    # Rule 5: check daily loss limit (proactive — block before it triggers).
+    # Include unrealized losses (but not gains) for a conservative risk assessment.
     if balance > 0:
-        loss_pct = (-state.daily_pnl / balance) * 100
+        effective_loss = -state.daily_pnl + max(0.0, -unrealized_pnl)
+        loss_pct = (effective_loss / balance) * 100
         if loss_pct >= _DAILY_LOSS_LIMIT_PCT:
             reason = (
-                f"daily loss {loss_pct:.2f}% >= limit {_DAILY_LOSS_LIMIT_PCT:.1f}%"
+                f"daily loss {loss_pct:.2f}% >= limit {_DAILY_LOSS_LIMIT_PCT:.1f}% "
+                f"(realized={state.daily_pnl:+.2f}, unrealized={unrealized_pnl:+.2f})"
             )
             state.block(reason)
             return False, reason
@@ -103,8 +107,8 @@ def validate(
         )
 
     logger.info(
-        "RiskGate: APPROVED %s %s confidence=%.0%% signals=%s",
-        thesis.symbol, thesis.action.upper(), thesis.confidence, thesis.signals_used,
+        "RiskGate: APPROVED %s %s confidence=%.0f%% signals=%s",
+        thesis.symbol, thesis.action.upper(), thesis.confidence * 100, thesis.signals_used,
     )
     return True, "approved"
 

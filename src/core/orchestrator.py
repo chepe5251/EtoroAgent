@@ -3,21 +3,21 @@ Orchestrator — swing trading, market-calendar-driven schedule.
 
 Architecture:
   REASONING PLANE  → ScreeningAgent (deterministic+LLM fast filter)
-                   → ResearchAgent (full ReAct per shortlisted symbol)
+                   → ResearchAgent  (full ReAct per shortlisted symbol)
   EXECUTION PLANE  → RiskGate → ExecutionAgent (no LLM)
-  REVIEW PLANE     → PositionReviewAgent (ReAct, once/day per position)
-  MAINTENANCE      → TrailingStopAgent (every 1h, deterministic)
+  REVIEW PLANE     → PositionReviewAgent (ReAct, 1×/day per position)
+  MAINTENANCE      → TrailingStopAgent (every 60 min, deterministic)
 
-Schedule per region (at market open + 5 min):
+Schedule per region (5 min after market open):
   US:     CronTrigger(hour=9, min=35, tz="America/New_York")
   EU:     CronTrigger(hour=9, min=5,  tz="Europe/Berlin")
   ASIA:   CronTrigger(hour=9, min=5,  tz="Asia/Tokyo")
   CRYPTO: every 6 hours UTC
 
 Daily:
-  Position review: 7:00 UTC (before any market opens)
-  Daily summary:   23:00 UTC
-  Trailing stops:  every 60 min
+  Position review:  07:00 UTC (before any equity market opens)
+  Daily summary:    23:00 UTC
+  Trailing stops:   every 60 min
 """
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ from src.agents.screening_agent import ScreeningAgent
 from src.agents.trailing_stop_agent import TrailingStopAgent
 from src.config.universe import get_symbols, get_instrument_id as cache_instrument_id
 from src.core.etoro_client import EtoroClient
-from src.core.market_calendar import is_trading_day, get_market_status
+from src.core.market_calendar import is_trading_day
 from src.core.state import Position, ProjectState
 from src.mcp_clients.mcp_manager import MCPManager
 
@@ -49,7 +49,6 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 _REGIONS = [r.strip().upper() for r in os.getenv("WATCH_REGIONS", "US,EU,ASIA,CRYPTO").split(",")]
-_MAX_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "5"))
 
 
 def _utcnow() -> datetime:
@@ -58,7 +57,10 @@ def _utcnow() -> datetime:
 
 class Orchestrator:
     def __init__(self):
-        self.state = ProjectState()
+        # Load persisted state from disk (positions survive restarts).
+        # get_portfolio() reconciliation runs at startup to sync with broker.
+        self.state = ProjectState.load()
+
         self.client = EtoroClient()
         self.mcp_manager = MCPManager()
 
@@ -85,14 +87,15 @@ class Orchestrator:
             await self.mcp_manager.start()
             try:
                 await self._validate_credentials()
+                await self._reconcile_open_positions()  # P0-2: sync with broker
                 await self._prefetch_instruments()
                 self._setup_schedules()
                 self._scheduler.start()
                 mode = os.getenv("ETORO_MODE", "demo").upper()
                 all_symbols = [s for r in _REGIONS for s in get_symbols(r)]
                 logger.info(
-                    "Orchestrator running — mode=%s regions=%s symbols≈%d",
-                    mode, _REGIONS, len(all_symbols),
+                    "Orchestrator running — mode=%s regions=%s symbols≈%d positions=%d",
+                    mode, _REGIONS, len(all_symbols), len(self.state.open_positions),
                 )
                 await self.notification_agent.send_startup(mode, all_symbols[:10])
                 while True:
@@ -106,12 +109,10 @@ class Orchestrator:
     # ── Schedule setup ────────────────────────────────────────────────────────
 
     def _setup_schedules(self):
-        # Per-region screening + research cycles
         region_schedules = {
-            "US":    dict(hour=9, minute=35, timezone="America/New_York"),
-            "EU":    dict(hour=9, minute=5,  timezone="Europe/Berlin"),
-            "ASIA":  dict(hour=9, minute=5,  timezone="Asia/Tokyo"),
-            "CRYPTO": None,  # handled by interval below
+            "US":   dict(hour=9, minute=35, timezone="America/New_York"),
+            "EU":   dict(hour=9, minute=5,  timezone="Europe/Berlin"),
+            "ASIA": dict(hour=9, minute=5,  timezone="Asia/Tokyo"),
         }
         for region in _REGIONS:
             if region == "CRYPTO":
@@ -125,10 +126,9 @@ class Orchestrator:
                     coalesce=True,
                 )
             elif region in region_schedules:
-                kwargs = region_schedules[region]
                 self._scheduler.add_job(
                     self._screen_region,
-                    CronTrigger(**kwargs),
+                    CronTrigger(**region_schedules[region]),
                     args=[region],
                     id=f"screen_{region}",
                     name=f"Screening {region}",
@@ -136,7 +136,6 @@ class Orchestrator:
                     coalesce=True,
                 )
 
-        # Daily position review (07:00 UTC — before any equity market opens)
         self._scheduler.add_job(
             self._review_positions,
             CronTrigger(hour=7, minute=0),
@@ -145,8 +144,6 @@ class Orchestrator:
             max_instances=1,
             coalesce=True,
         )
-
-        # Trailing stops every 60 min
         self._scheduler.add_job(
             self._trailing_stop_cycle,
             IntervalTrigger(minutes=60),
@@ -155,8 +152,6 @@ class Orchestrator:
             max_instances=1,
             coalesce=True,
         )
-
-        # Daily summary at 23:00 UTC
         self._scheduler.add_job(
             self._daily_summary,
             CronTrigger(hour=23, minute=0),
@@ -167,11 +162,9 @@ class Orchestrator:
     # ── Scheduled jobs ────────────────────────────────────────────────────────
 
     async def _screen_region(self, region: str):
-        """Screen all symbols in a region and deep-research the shortlist."""
         logger.info("=== Screening %s — %s ===", region, _utcnow().isoformat())
         self.state.reset_daily_if_needed()
 
-        # Skip equity regions on non-trading days
         if region != "CRYPTO" and not is_trading_day(region):
             logger.info("Screening %s: not a trading day — skipping", region)
             return
@@ -183,10 +176,8 @@ class Orchestrator:
 
         symbols = get_symbols(region)
         if not symbols:
-            logger.warning("No symbols for region %s", region)
             return
 
-        # Stage 1: Screen
         try:
             shortlist = await self.screening_agent.run(symbols)
         except Exception as exc:
@@ -199,10 +190,12 @@ class Orchestrator:
 
         logger.info("Screening %s: researching shortlist=%s", region, shortlist)
 
-        # Stage 2: Deep research on shortlist
+        # Compute unrealized P&L once before the research loop (P1-4)
+        unrealized_pnl = self._unrealized_pnl()
+
         for symbol in shortlist:
             try:
-                await self._research_and_execute(symbol, balance)
+                await self._research_and_execute(symbol, balance, unrealized_pnl)
             except Exception as exc:
                 logger.error("Error on %s: %s", symbol, exc, exc_info=True)
                 await self.notification_agent.send_critical_error(
@@ -212,15 +205,15 @@ class Orchestrator:
         self.state.last_updated = _utcnow()
         logger.info("=== Screening %s complete ===", region)
 
-    async def _research_and_execute(self, symbol: str, balance: float):
-        # ── Deep ReAct research ───────────────────────────────────────────
+    async def _research_and_execute(self, symbol: str, balance: float, unrealized_pnl: float):
         thesis = await self.research_agent.run(symbol)
         if thesis is None:
             logger.warning("%s: no thesis produced", symbol)
             return
 
-        # ── Risk gate ─────────────────────────────────────────────────────
-        approved, reason = risk_gate_module.validate(thesis, self.state, balance)
+        approved, reason = risk_gate_module.validate(
+            thesis, self.state, balance, unrealized_pnl=unrealized_pnl
+        )
         if not approved:
             logger.info("%s: rejected — %s", symbol, reason)
             if thesis.action != "hold":
@@ -229,7 +222,6 @@ class Orchestrator:
                 await self.notification_agent.send_risk_blocked(self.state.risk_block_reason)
             return
 
-        # ── Size + execute ────────────────────────────────────────────────
         instrument_id = self._instrument_cache.get(symbol)
         if not instrument_id:
             logger.warning("%s: no instrument_id — skipping", symbol)
@@ -238,8 +230,8 @@ class Orchestrator:
         current_price, atr = await self._fetch_price_and_atr(symbol)
         order = size_position(thesis, instrument_id, balance, current_price, atr)
         logger.info(
-            "%s: placing order amount=$%.2f stop=%.4f%%",
-            symbol, order.amount_usd, order.stop_loss_pct,
+            "%s: placing order amount=$%.2f stop=%.4f%% horizon=%dd",
+            symbol, order.amount_usd, order.stop_loss_pct, thesis.horizon_days,
         )
         await self.execution_agent.execute(order)
 
@@ -271,6 +263,77 @@ class Orchestrator:
         else:
             logger.warning("Balance=0 — check credentials or ETORO_MODE")
 
+    async def _reconcile_open_positions(self):
+        """Sync in-memory state against live broker portfolio at startup (P0-2)."""
+        try:
+            portfolio = await self.client.get_portfolio()
+        except Exception as exc:
+            logger.warning(
+                "Portfolio reconcile failed: %s — using saved state (%d positions)",
+                exc, len(self.state.open_positions),
+            )
+            return
+
+        if not isinstance(portfolio, list):
+            logger.warning("Unexpected portfolio format: %s", type(portfolio))
+            return
+
+        broker_ids: dict[str, dict] = {}
+        for item in portfolio:
+            pid = str(item.get("positionId", item.get("id", "")))
+            if pid:
+                broker_ids[pid] = item
+
+        # Update current rates for known positions; remove positions closed externally
+        for pos in list(self.state.open_positions):
+            if pos.position_id in broker_ids:
+                item = broker_ids[pos.position_id]
+                pos.current_rate = float(
+                    item.get("currentRate", item.get("rate", pos.current_rate))
+                )
+            else:
+                logger.warning(
+                    "Position %s (%s) not in broker portfolio — removing from state",
+                    pos.position_id, pos.symbol,
+                )
+                self.state.remove_position(pos.position_id)
+
+        # Add positions opened before last restart that aren't in our state
+        known_ids = {p.position_id for p in self.state.open_positions}
+        for pid, item in broker_ids.items():
+            if pid in known_ids:
+                continue
+            try:
+                symbol = str(
+                    item.get("instrumentName", item.get("ticker", "UNKNOWN"))
+                ).upper()
+                opened_str = item.get("openDateTime", item.get("openDate", _utcnow().isoformat()))
+                opened_at = datetime.fromisoformat(
+                    opened_str.replace("Z", "+00:00") if isinstance(opened_str, str) else _utcnow().isoformat()
+                )
+                pos = Position(
+                    position_id=pid,
+                    instrument_id=str(item.get("instrumentId", "")),
+                    symbol=symbol,
+                    is_buy=bool(item.get("isBuy", True)),
+                    amount_usd=float(item.get("amount", item.get("investmentAmount", 0))),
+                    entry_rate=float(item.get("openRate", item.get("openPrice", 0))),
+                    stop_loss_pct=float(item.get("stopLoss", item.get("stopLossRate", 2.0))),
+                    opened_at=opened_at,
+                )
+                self.state.open_positions.append(pos)
+                logger.info(
+                    "Reconciled external position: %s %s opened=%s",
+                    "BUY" if pos.is_buy else "SELL", symbol, opened_at.date(),
+                )
+            except Exception as exc:
+                logger.warning("Could not reconcile position %s: %s", pid, exc)
+
+        logger.info(
+            "Reconciliation complete — %d position(s) in state", len(self.state.open_positions)
+        )
+        self.state.save()
+
     async def _get_balance(self) -> float:
         try:
             data = await self.client.get_balance()
@@ -281,19 +344,27 @@ class Orchestrator:
             logger.error("get_balance failed: %s", exc)
             return 0.0
 
+    def _unrealized_pnl(self) -> float:
+        """Estimate unrealized P&L using cached current rates vs entry rates (P1-4)."""
+        total = 0.0
+        for pos in self.state.open_positions:
+            if pos.current_rate and pos.entry_rate:
+                if pos.is_buy:
+                    total += (pos.current_rate - pos.entry_rate) / pos.entry_rate * pos.amount_usd
+                else:
+                    total += (pos.entry_rate - pos.current_rate) / pos.entry_rate * pos.amount_usd
+        return total
+
     async def _prefetch_instruments(self):
-        """Resolve symbol → instrument_id at startup. Uses cache when available."""
         all_symbols: list[str] = []
         for region in _REGIONS:
             all_symbols.extend(get_symbols(region))
 
         for symbol in all_symbols:
-            # Try discovery cache first
             cached = cache_instrument_id(symbol)
             if cached:
                 self._instrument_cache[symbol] = cached
                 continue
-            # Fall back to live lookup
             try:
                 instr_id = await self.client.get_instrument_id(symbol)
                 if instr_id:

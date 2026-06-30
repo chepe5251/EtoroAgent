@@ -18,7 +18,14 @@ try:
     _HAS_MCAL = True
 except ImportError:
     _HAS_MCAL = False
-    logger.warning("pandas_market_calendars not installed — using weekday-only calendar")
+    # FAIL-CLOSED: when the library is absent we do NOT assume any equity market is open.
+    # This prevents trading on holidays.  The bot will skip equity regions until the
+    # library is installed.  Crypto (24/7) is unaffected.
+    logger.critical(
+        "pandas_market_calendars is not installed. "
+        "Equity market open/close detection is DISABLED. "
+        "Install it with: pip install pandas-market-calendars"
+    )
 
 # ── Region config ─────────────────────────────────────────────────────────────
 # calendar: pandas_market_calendars name, None = 24/7
@@ -105,9 +112,16 @@ def is_trading_day(region: str, d: date | None = None) -> bool:
             return not schedule.empty
         except Exception as exc:
             logger.debug("mcal.schedule failed for %s on %s: %s", region, d, exc)
+            # If the calendar query itself fails, fall back to weekday-only
+            return d.weekday() < 5
 
-    # Fallback: Mon–Fri
-    return d.weekday() < 5
+    # Library not installed: fail-closed for equity regions.
+    # Return False so the bot skips equity cycles rather than trading on holidays.
+    logger.warning(
+        "is_trading_day(%s, %s): pandas_market_calendars unavailable — assuming CLOSED",
+        region, d,
+    )
+    return False
 
 
 def get_market_status(region: str, dt: datetime | None = None) -> MarketWindow:

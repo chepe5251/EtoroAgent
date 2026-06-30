@@ -46,8 +46,7 @@ def size_position(
     """
     Deterministic position sizing.
     - Amount: MAX_POSITION_SIZE_PCT % of available balance
-    - Stop-loss: thesis.suggested_stop_loss_atr_multiple × ATR, expressed
-      as a % of current price
+    - Stop-loss: thesis.suggested_stop_loss_atr_multiple × ATR as % of price
     """
     amount_usd = balance * (_MAX_POSITION_SIZE_PCT / 100.0)
     amount_usd = round(amount_usd, 2)
@@ -66,11 +65,6 @@ def size_position(
 
 
 class ExecutionAgent:
-    """
-    Submits a SizedOrder to eToro and updates shared state.
-    Retries once on failure, then notifies and aborts.
-    """
-
     def __init__(
         self,
         client: "EtoroClient",
@@ -82,8 +76,11 @@ class ExecutionAgent:
         self.notification_agent = notification_agent
 
     async def execute(self, order: SizedOrder) -> bool:
-        """
-        Open a position. Returns True on success, False on failure.
+        """Open a position. Returns True on success, False on failure.
+
+        Single attempt only — EtoroClient does NOT retry writes to avoid
+        duplicate positions.  If the call fails, the caller should reconcile
+        against get_portfolio() before retrying.
         """
         is_buy = order.thesis.action == "buy"
         symbol = order.thesis.symbol
@@ -92,12 +89,16 @@ class ExecutionAgent:
             "BUY" if is_buy else "SELL", symbol, order.amount_usd, order.stop_loss_pct,
         )
 
-        result = await self._try_open(order, is_buy, attempt=1)
-        if result is None:
-            result = await self._try_open(order, is_buy, attempt=2)
-
-        if result is None:
-            msg = f"Failed to open {symbol} after 2 attempts"
+        try:
+            result = await self.client.open_position(
+                instrument_id=order.instrument_id,
+                amount_usd=order.amount_usd,
+                is_buy=is_buy,
+                stop_loss_pct=order.stop_loss_pct,
+                trailing_stop=True,
+            )
+        except Exception as exc:
+            msg = f"Failed to open {symbol}: {exc}"
             logger.error("ExecutionAgent: %s", msg)
             await self.notification_agent.send_critical_error(msg)
             return False
@@ -118,11 +119,14 @@ class ExecutionAgent:
             opened_at=_utcnow(),
             current_rate=rate,
             atr=order.atr,
+            horizon_days=order.thesis.horizon_days,
+            invalidation_condition=order.thesis.invalidation_condition,
         )
         self.state.open_positions.append(pos)
+        self.state.save()  # persist immediately so state survives a crash
         logger.info(
-            "ExecutionAgent: position opened id=%s %s rate=%.4f",
-            position_id, symbol, rate,
+            "ExecutionAgent: position opened id=%s %s rate=%.4f horizon=%dd",
+            position_id, symbol, rate, pos.horizon_days,
         )
         await self.notification_agent.send_position_opened(pos)
         return True
@@ -152,6 +156,7 @@ class ExecutionAgent:
 
         duration = _utcnow() - pos.opened_at
         self.state.remove_position(position_id)
+        self.state.save()  # persist immediately
 
         from src.agents import risk_gate
         risk_gate.record_closed_pnl(self.state, pnl)
@@ -159,19 +164,3 @@ class ExecutionAgent:
         logger.info("ExecutionAgent: %s closed pnl=%.2f duration=%s", pos.symbol, pnl, duration)
         await self.notification_agent.send_position_closed(pos, pnl, duration)
         return True
-
-    async def _try_open(self, order: SizedOrder, is_buy: bool, attempt: int):
-        try:
-            return await self.client.open_position(
-                instrument_id=order.instrument_id,
-                amount_usd=order.amount_usd,
-                is_buy=is_buy,
-                stop_loss_pct=order.stop_loss_pct,
-                trailing_stop=True,
-            )
-        except Exception as exc:
-            logger.warning(
-                "ExecutionAgent: open attempt %d failed for %s: %s",
-                attempt, order.thesis.symbol, exc,
-            )
-            return None

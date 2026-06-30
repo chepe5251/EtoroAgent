@@ -5,6 +5,7 @@ listing tools (in OpenAI function-calling schema) and calling them by name.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -49,6 +50,9 @@ class MCPManager:
         self._tool_registry: dict[str, tuple[ClientSession, Any]] = {}
         self._exit_stack = AsyncExitStack()
         self._started = False
+        # One asyncio.Lock per session to prevent concurrent stdio stream access
+        # from overlapping APScheduler jobs (e.g. screen_US and screen_CRYPTO).
+        self._session_locks: dict[int, asyncio.Lock] = {}
 
     async def start(self):
         """Start all MCP server subprocesses and build the tool registry."""
@@ -135,13 +139,21 @@ class MCPManager:
 
         Returns the parsed result (dict/list/str depending on the tool).
         Raises ValueError if the tool is not registered.
+
+        Each server's ClientSession uses stdio streams that are not safe for
+        concurrent use from multiple asyncio tasks.  We serialize calls per
+        session via a per-session asyncio.Lock.
         """
         if tool_name not in self._tool_registry:
             raise ValueError(
                 f"Tool '{tool_name}' not found. Available: {list(self._tool_registry)}"
             )
         session, _ = self._tool_registry[tool_name]
-        result = await session.call_tool(tool_name, arguments)
+        session_id = id(session)
+        if session_id not in self._session_locks:
+            self._session_locks[session_id] = asyncio.Lock()
+        async with self._session_locks[session_id]:
+            result = await session.call_tool(tool_name, arguments)
 
         # MCP result.content is a list of Content items (TextContent, etc.)
         if not result.content:

@@ -327,3 +327,16 @@ class ReActRuntime:
             logger.debug("Trace saved → %s", filename)
         except Exception as exc:
             logger.warning("Could not save trace: %s", exc)
+            return
+
+        # Rotate: keep only the 200 most recent trace files (P3)
+        try:
+            traces = sorted(
+                _LOGS_DIR.glob("research_trace_*.json"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            for old in traces[200:]:
+                old.unlink(missing_ok=True)
+        except Exception as exc:
+            logger.warning("Trace rotation failed: %s", exc)

@@ -11,6 +11,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY src/ ./src/
+COPY skills/ ./skills/
 COPY main.py .
 
 # Logs dir must exist inside container; bind-mounted from host

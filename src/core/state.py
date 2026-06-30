@@ -1,6 +1,15 @@
-from dataclasses import dataclass, field
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+_STATE_FILE = Path("state.json")
 
 
 def _utcnow() -> datetime:
@@ -24,7 +33,7 @@ class Position:
 
     @property
     def days_open(self) -> int:
-        return (datetime.now(timezone.utc) - self.opened_at).days
+        return (_utcnow() - self.opened_at).days
 
     @property
     def max_hold_until(self) -> datetime:
@@ -33,6 +42,42 @@ class Position:
     @property
     def is_past_hard_exit(self) -> bool:
         return self.days_open >= 20
+
+    def to_dict(self) -> dict:
+        return {
+            "position_id": self.position_id,
+            "instrument_id": self.instrument_id,
+            "symbol": self.symbol,
+            "is_buy": self.is_buy,
+            "amount_usd": self.amount_usd,
+            "entry_rate": self.entry_rate,
+            "stop_loss_pct": self.stop_loss_pct,
+            "opened_at": self.opened_at.isoformat(),
+            "current_rate": self.current_rate,
+            "atr": self.atr,
+            "horizon_days": self.horizon_days,
+            "invalidation_condition": self.invalidation_condition,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Position":
+        opened_at = datetime.fromisoformat(d["opened_at"])
+        if opened_at.tzinfo is None:
+            opened_at = opened_at.replace(tzinfo=timezone.utc)
+        return cls(
+            position_id=d["position_id"],
+            instrument_id=d["instrument_id"],
+            symbol=d["symbol"],
+            is_buy=bool(d["is_buy"]),
+            amount_usd=float(d["amount_usd"]),
+            entry_rate=float(d["entry_rate"]),
+            stop_loss_pct=float(d["stop_loss_pct"]),
+            opened_at=opened_at,
+            current_rate=float(d.get("current_rate", 0.0)),
+            atr=float(d.get("atr", 0.0)),
+            horizon_days=int(d.get("horizon_days", 10)),
+            invalidation_condition=str(d.get("invalidation_condition", "")),
+        )
 
 
 class ProjectState:
@@ -66,3 +111,47 @@ class ProjectState:
     def block(self, reason: str):
         self.is_risk_blocked = True
         self.risk_block_reason = reason
+
+    # ── Persistence ────────────────────────────────────────────────────────────
+
+    def save(self, path: Path | None = None) -> None:
+        """Persist state to JSON for crash recovery."""
+        target = path or _STATE_FILE
+        data = {
+            "open_positions": [p.to_dict() for p in self.open_positions],
+            "daily_pnl": self.daily_pnl,
+            "is_risk_blocked": self.is_risk_blocked,
+            "risk_block_reason": self.risk_block_reason,
+            "_daily_reset_date": self._daily_reset_date,
+            "saved_at": _utcnow().isoformat(),
+        }
+        try:
+            target.write_text(json.dumps(data, indent=2))
+        except Exception as exc:
+            logger.warning("Could not save state to %s: %s", target, exc)
+
+    @classmethod
+    def load(cls, path: Path | None = None) -> "ProjectState":
+        """Load persisted state. Returns a fresh state if file is missing or corrupt."""
+        target = path or _STATE_FILE
+        state = cls()
+        if not target.exists():
+            return state
+        try:
+            data = json.loads(target.read_text())
+            state.open_positions = [
+                Position.from_dict(p) for p in data.get("open_positions", [])
+            ]
+            state.daily_pnl = float(data.get("daily_pnl", 0.0))
+            state.is_risk_blocked = bool(data.get("is_risk_blocked", False))
+            state.risk_block_reason = str(data.get("risk_block_reason", ""))
+            state._daily_reset_date = str(
+                data.get("_daily_reset_date", _utcnow().date().isoformat())
+            )
+            logger.info(
+                "State loaded from %s: %d open positions, daily_pnl=%.2f",
+                target, len(state.open_positions), state.daily_pnl,
+            )
+        except Exception as exc:
+            logger.warning("Could not load state from %s: %s — using fresh state", target, exc)
+        return state

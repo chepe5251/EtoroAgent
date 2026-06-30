@@ -96,7 +96,7 @@ async def reddit_get_subreddit_sentiment(
                         "sort": "new",
                         "limit": limit,
                         "t": "day",
-                        "restrict_sr": True,
+                        "restrict_sr": "1",  # httpx serialises bool True as "True"; Reddit expects "1"
                     },
                 )
                 resp.raise_for_status()
