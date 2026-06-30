@@ -23,7 +23,7 @@ _API_BASE = "https://oauth.reddit.com"
 
 _CRYPTO_SUBS = ["CryptoCurrency", "CryptoMarkets", "Bitcoin", "ethereum"]
 _EQUITY_SUBS = ["wallstreetbets", "stocks", "investing"]
-_CRYPTO_TICKERS = {"BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "DOGE", "AVAX", "MATIC"}
+_CRYPTO_TICKERS = {"BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "DOGE", "AVAX", "POL"}
 
 
 def _creds() -> tuple[str, str, str]:
