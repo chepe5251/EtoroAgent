@@ -7,9 +7,30 @@ Indicators at bar i are computed ONLY from bars 0..i (inclusive).
 This is guaranteed structurally:
   - Indicator series use pandas rolling/ewm with no negative shifts.
   - Signals are read from row i; entries fill at row i+1 OPEN.
-  - Stop losses fill at the stop price when low_i < stop (intraday, using
-    bar i data only — the stop was set from bar i-1 or earlier data).
+  - Stop losses fill at the stop price (or gap-open) using bar i data only.
   - All exit conditions (RSI TP, time limit) fill at bar i+1 OPEN.
+  - MTM (mark-to-market) at bar i uses close[i] of already-open positions only;
+    newly-signalled positions (entry_bar = i+1) are excluded from bar i's MTM.
+
+HONESTY FIXES (relative to initial version)
+============================================
+A1 — Mark-to-market equity curve
+    equity_curve[i] = realised_cash + unrealised_pnl_of_open_positions_at_close[i]
+    This means draw-down and Sharpe now reflect intra-trade adverse excursions,
+    not just closed-trade P&L.  A trade that goes -8% before recovering to +2%
+    now shows the -8% trough in the equity curve.
+
+A2 — Gap-through fills
+    If a stop/trail bar opens at or below the stop level (e.g., overnight gap),
+    the fill is at open × (1−cost), not stop × (1−cost).  Previously, stops always
+    filled at the exact stop price regardless of where the bar opened.
+
+A3 — Per-asset-class costs + overnight carry
+    Equity and crypto have very different cost structures on eToro:
+      Equity: tight spread (~0.07%), low slippage, 0% commission, low carry
+      Crypto: wide spread (~1%), higher slippage, significant overnight CFD fees
+    Each cost is parametrised separately in BacktestConfig.
+    Overnight carry is deducted from P&L at close: notional × carry_pct × hold_days.
 
 CORRESPONDENCE WITH src/tools/technical.py
 ==========================================
@@ -63,17 +84,49 @@ class BacktestConfig:
     trail_atr_multiple: float = 1.5      # for trailing: trail by N×ATR
     max_hold_days: int = 20              # hard time limit
 
-    # Costs (conservative realistic defaults for eToro)
-    spread_pct: float = 0.05            # 0.05% one-way
-    slippage_pct: float = 0.05          # 0.05% one-way
-    commission_pct: float = 0.0         # eToro stocks: 0% commission
+    # ── Per-asset-class costs (A3) ────────────────────────────────────────────
+    # Equity (eToro stocks / ETFs)
+    # Source: eToro help-centre fee schedule + typical mid-spread observations.
+    #   - Commission: 0% (eToro charges no explicit commission on real stocks)
+    #   - Spread:     ~0.07–0.09% on liquid large-caps; use 0.07% conservative
+    #   - Slippage:   ~0.03% market-impact for small retail sizes
+    #   - Carry:      eToro charges an overnight CFD fee on leveraged positions;
+    #                 for non-leveraged stocks the fee is usually 0.  We model a
+    #                 small residual (e.g. borrow cost, transaction tax amortised)
+    #                 at 0.01%/day ≈ 2.5%/yr.  Adjust to 0 for pure stock accounts.
+    equity_spread_pct: float = 0.07
+    equity_slippage_pct: float = 0.03
+    equity_commission_pct: float = 0.0
+    equity_carry_daily_pct: float = 0.01   # %/day of notional
+
+    # Crypto (eToro crypto CFDs)
+    # Source: eToro crypto spread page (BTC ~0.75%, ETH ~1.9%, altcoins up to 3%).
+    #   - Spread:     use 0.75% as conservative average across BTC/ETH/SOL
+    #   - Slippage:   0.25% (thinner order book than equities)
+    #   - Carry:      eToro charges an overnight CFD financing fee; for crypto
+    #                 this is typically 0.05–0.10%/night (≈18–36%/yr).
+    #                 We use 0.06%/day ≈ 22%/yr as the conservative default.
+    crypto_spread_pct: float = 0.75
+    crypto_slippage_pct: float = 0.25
+    crypto_commission_pct: float = 0.0
+    crypto_carry_daily_pct: float = 0.06   # %/day of notional
 
     # Portfolio constraints
     max_positions: int = 3
 
-    @property
-    def cost_per_side(self) -> float:
-        return (self.spread_pct + self.slippage_pct + self.commission_pct) / 100.0
+    def cost_per_side(self, asset_class: str = "equity") -> float:
+        """One-way transaction cost as a fraction (not %). A3."""
+        if asset_class == "crypto":
+            return (self.crypto_spread_pct + self.crypto_slippage_pct +
+                    self.crypto_commission_pct) / 100.0
+        return (self.equity_spread_pct + self.equity_slippage_pct +
+                self.equity_commission_pct) / 100.0
+
+    def daily_carry(self, asset_class: str = "equity") -> float:
+        """Daily carry cost as a fraction of notional (not %). A3."""
+        if asset_class == "crypto":
+            return self.crypto_carry_daily_pct / 100.0
+        return self.equity_carry_daily_pct / 100.0
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -105,12 +158,13 @@ class Trade:
     entry_price: float
     exit_price: float
     notional: float
-    pnl: float                           # $ P&L after costs
+    pnl: float                           # $ P&L after all costs (incl. carry)
     pnl_pct: float                       # % P&L on notional
     holding_days: int
-    exit_reason: str                     # "stop_loss" | "tp_rsi" | "time_limit" | "trail_stop" | "end_of_data"
+    exit_reason: str                     # "stop_loss"|"tp_rsi"|"time_limit"|"trail_stop"|"end_of_data"
     signal_type: str
     asset_class: str
+    carry_cost: float = 0.0              # $ carry deducted (for transparency)
 
 
 @dataclass
@@ -236,6 +290,49 @@ def _entry_signal(row: pd.Series, cfg: BacktestConfig) -> Optional[str]:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Internal helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _gap_fill(
+    open_price: float,
+    stop_level: float,
+    cost: float = 0.0,      # accepted for API symmetry; not used in body
+    direction: str = "long",
+) -> float:
+    """
+    Compute raw fill price for a stop, accounting for gap-through (A2).
+
+    For a LONG position:
+      - Normal: bar opens above stop → intraday trade-through → fill at stop.
+      - Gap-down: bar opens at/below stop → fill at open (cannot fill above open).
+
+    Returns the raw fill price BEFORE deducting transaction cost.
+    The caller multiplies by (1 − cost) for a long or (1 + cost) for a short.
+    """
+    if direction == "long":
+        return open_price if open_price <= stop_level else stop_level
+    else:  # short (Phase B)
+        return open_price if open_price >= stop_level else stop_level
+
+
+def _unrealised_pnl(
+    positions: list[_OpenPosition], close_price: float, current_bar: int
+) -> float:
+    """
+    Sum of unrealised P&L for OPEN positions at close_price (A1 MTM).
+
+    Positions with entry_bar > current_bar have not yet been entered
+    (signalled this bar, fill next bar) and are excluded.
+    """
+    total = 0.0
+    for pos in positions:
+        if pos.entry_bar <= current_bar:
+            units = pos.notional / pos.entry_price
+            total += (close_price - pos.entry_price) * units
+    return total
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Main backtest loop
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -250,73 +347,80 @@ def run(
 
     Returns a RunResult with all trades and the equity curve.
     The equity curve has one entry per bar (length == len(df)).
+    equity_curve[i] = realised_cash + unrealised_pnl_of_open_positions  (A1 MTM).
     """
     df_ind = _add_indicators(df, cfg)
     n = len(df_ind)
 
-    equity = cfg.initial_equity
-    equity_curve: list[float] = [equity] * n
+    realised_equity = cfg.initial_equity   # cash after closed trades
+    equity_curve: list[float] = [realised_equity] * n
     positions: list[_OpenPosition] = []
     trades: list[Trade] = []
 
-    # Warmup: need SMA200 + some additional stabilisation
     warmup = cfg.sma_trend + 10
 
     for i in range(n):
         row = df_ind.iloc[i]
+        cost = cfg.cost_per_side(asset_class)
 
         # ── Update trailing stops in-flight ──────────────────────────────────
         for pos in positions:
             if cfg.exit_mode == "trailing" and pos.trail_stop > 0:
-                # Ratchet up the trail if price moved further up
-                new_trail = row["close"] - cfg.trail_atr_multiple * row["atr"]
+                atr_val = row["atr"] if np.isfinite(row["atr"]) else 0.0
+                new_trail = row["close"] - cfg.trail_atr_multiple * atr_val
                 if new_trail > pos.trail_stop:
                     pos.trail_stop = new_trail
 
-        # ── Check exits (current bar's OHLC, no future data) ─────────────────
+        # ── Check exits ───────────────────────────────────────────────────────
         for pos in list(positions):
             exit_price: Optional[float] = None
             exit_reason: str = ""
+            pos_cost = cfg.cost_per_side(pos.asset_class)
 
-            # 1. Stop loss — intraday fill at stop price
+            # 1. Stop loss — with gap-through check (A2)
             if row["low"] <= pos.stop_price:
-                exit_price = pos.stop_price * (1 - cfg.cost_per_side)
+                raw = _gap_fill(row["open"], pos.stop_price, "long")
+                exit_price = raw * (1.0 - pos_cost)
                 exit_reason = "stop_loss"
 
-            # 2. Trailing stop hit
+            # 2. Trailing stop — with gap-through check (A2)
             elif cfg.exit_mode == "trailing" and pos.trail_stop > 0:
                 if row["low"] <= pos.trail_stop:
-                    exit_price = pos.trail_stop * (1 - cfg.cost_per_side)
+                    raw = _gap_fill(row["open"], pos.trail_stop, "long")
+                    exit_price = raw * (1.0 - pos_cost)
                     exit_reason = "trail_stop"
 
             # 3. Time limit → fill at next bar's open
             elif (i - pos.entry_bar) >= cfg.max_hold_days:
                 if i + 1 < n:
-                    exit_price = df_ind.iloc[i + 1]["open"] * (1 - cfg.cost_per_side)
+                    exit_price = df_ind.iloc[i + 1]["open"] * (1.0 - pos_cost)
                 else:
-                    exit_price = row["close"] * (1 - cfg.cost_per_side)
+                    exit_price = row["close"] * (1.0 - pos_cost)
                 exit_reason = "time_limit"
 
-            # 4. Mean-reversion TP: RSI returns to mid-range → fill at next open
+            # 4. Mean-reversion TP → fill at next bar's open
             elif cfg.exit_mode == "mean_reversion":
                 rsi_val = row.get("rsi", np.nan)
                 if np.isfinite(rsi_val) and rsi_val >= cfg.tp_rsi_level:
                     if i + 1 < n:
-                        exit_price = df_ind.iloc[i + 1]["open"] * (1 - cfg.cost_per_side)
+                        exit_price = df_ind.iloc[i + 1]["open"] * (1.0 - pos_cost)
                     else:
-                        exit_price = row["close"] * (1 - cfg.cost_per_side)
+                        exit_price = row["close"] * (1.0 - pos_cost)
                     exit_reason = "tp_rsi"
 
             if exit_price is not None:
-                pnl_per_unit = exit_price - pos.entry_price
+                holding_days = i - pos.entry_bar
+                # A3: deduct overnight carry from P&L
+                carry_cost = pos.notional * cfg.daily_carry(pos.asset_class) * holding_days
                 units = pos.notional / pos.entry_price
-                pnl = pnl_per_unit * units
+                raw_pnl = (exit_price - pos.entry_price) * units
+                pnl = raw_pnl - carry_cost
                 pnl_pct = pnl / pos.notional * 100.0
-                equity += pnl
+                realised_equity += pnl
                 trades.append(Trade(
                     symbol=pos.symbol,
                     entry_date=pos.entry_date,
-                    exit_date=df_ind.index[i] if hasattr(df_ind.index, "__iter__") else i,
+                    exit_date=df_ind.index[i],
                     entry_bar=pos.entry_bar,
                     exit_bar=i,
                     entry_price=pos.entry_price,
@@ -324,42 +428,40 @@ def run(
                     notional=pos.notional,
                     pnl=pnl,
                     pnl_pct=pnl_pct,
-                    holding_days=i - pos.entry_bar,
+                    holding_days=holding_days,
                     exit_reason=exit_reason,
                     signal_type=pos.signal_type,
-                    asset_class=asset_class,
+                    asset_class=pos.asset_class,
+                    carry_cost=carry_cost,
                 ))
                 positions.remove(pos)
 
         # ── Activate trailing stop when profitable ────────────────────────────
         if cfg.exit_mode == "trailing":
+            atr_val = row["atr"] if np.isfinite(row["atr"]) else 0.0
             for pos in positions:
-                if pos.trail_stop == 0:
+                if pos.trail_stop == 0 and pos.entry_bar <= i:
                     gain = row["close"] - pos.entry_price
-                    threshold = 0.5 * row["atr"]  # activate after 0.5×ATR gain
-                    if gain >= threshold:
-                        pos.trail_stop = row["close"] - cfg.trail_atr_multiple * row["atr"]
+                    if gain >= 0.5 * atr_val:
+                        pos.trail_stop = row["close"] - cfg.trail_atr_multiple * atr_val
 
-        # ── Entry signal (only after warmup, only if slot available) ─────────
+        # ── Entry signal ──────────────────────────────────────────────────────
         if i >= warmup and i < n - 1 and len(positions) < cfg.max_positions:
-            # Check no duplicate symbol already open
             open_symbols = {p.symbol for p in positions}
             if symbol not in open_symbols:
                 sig = _entry_signal(row, cfg)
                 if sig:
                     next_row = df_ind.iloc[i + 1]
-                    entry_price = next_row["open"] * (1 + cfg.cost_per_side)
+                    entry_price = next_row["open"] * (1.0 + cost)
                     stop_dist = row["atr"] * cfg.atr_stop_multiple
-                    if stop_dist > 0:
+                    if stop_dist > 0 and np.isfinite(stop_dist):
                         stop_price = entry_price - stop_dist
-                        # Risk-based sizing
-                        risk_amount = equity * (cfg.risk_per_trade_pct / 100.0)
+                        risk_amount = realised_equity * (cfg.risk_per_trade_pct / 100.0)
                         units = risk_amount / stop_dist
                         notional = units * entry_price
-                        # Cap notional
-                        max_notional = equity * (cfg.max_notional_pct / 100.0)
+                        max_notional = realised_equity * (cfg.max_notional_pct / 100.0)
                         notional = min(notional, max_notional)
-                        if notional >= 1.0 and equity > 0:
+                        if notional >= 1.0 and realised_equity > 0:
                             positions.append(_OpenPosition(
                                 symbol=symbol,
                                 entry_bar=i + 1,
@@ -371,16 +473,24 @@ def run(
                                 signal_type=sig,
                             ))
 
-        equity_curve[i] = equity
+        # ── A1: MTM equity curve ──────────────────────────────────────────────
+        # Unrealised P&L uses close[i] of positions that have actually entered
+        # (entry_bar <= i). Positions signalled this bar (entry_bar = i+1) excluded.
+        unrealised = _unrealised_pnl(positions, row["close"], i)
+        equity_curve[i] = realised_equity + unrealised
 
-    # ── Close any positions still open at the last bar ────────────────────────
+    # ── Force-close any remaining open positions at end of data ───────────────
+    last_row = df_ind.iloc[-1]
     for pos in positions:
-        last_price = df_ind.iloc[-1]["close"] * (1 - cfg.cost_per_side)
-        pnl_per_unit = last_price - pos.entry_price
+        pos_cost = cfg.cost_per_side(pos.asset_class)
+        last_price = last_row["close"] * (1.0 - pos_cost)
+        holding_days = n - 1 - pos.entry_bar
+        carry_cost = pos.notional * cfg.daily_carry(pos.asset_class) * holding_days
         units = pos.notional / pos.entry_price
-        pnl = pnl_per_unit * units
+        raw_pnl = (last_price - pos.entry_price) * units
+        pnl = raw_pnl - carry_cost
         pnl_pct = pnl / pos.notional * 100.0
-        equity += pnl
+        realised_equity += pnl
         trades.append(Trade(
             symbol=pos.symbol,
             entry_date=pos.entry_date,
@@ -392,12 +502,14 @@ def run(
             notional=pos.notional,
             pnl=pnl,
             pnl_pct=pnl_pct,
-            holding_days=n - 1 - pos.entry_bar,
+            holding_days=holding_days,
             exit_reason="end_of_data",
             signal_type=pos.signal_type,
-            asset_class=asset_class,
+            asset_class=pos.asset_class,
+            carry_cost=carry_cost,
         ))
-        equity_curve[-1] = equity
+    # After force-close, all positions closed — realised == MTM
+    equity_curve[-1] = realised_equity
 
     return RunResult(
         trades=trades,
