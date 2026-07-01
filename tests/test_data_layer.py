@@ -150,7 +150,7 @@ def _make_raw_candles(n: int, start_date: str = "2020-01-01") -> list[dict]:
 
 
 def run_async(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 @pytest.fixture
