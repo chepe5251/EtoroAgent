@@ -83,12 +83,9 @@ async def etoro_get_portfolio() -> list:
 
 
 @mcp.tool()
-async def etoro_get_balance() -> dict:
+async def etoro_get_balance() -> float:
     """
-    Get the current account balance and available funds.
-
-    Returns:
-        Dict with keys: availableToTrade, balance/equity, currency
+    Get the current tradable account balance in USD.
     """
     client = await _get_client()
     return await client.get_balance()

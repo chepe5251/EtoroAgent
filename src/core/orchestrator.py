@@ -42,7 +42,7 @@ from src.agents.trailing_stop_agent import TrailingStopAgent
 from src.config.universe import get_symbols, get_instrument_id as cache_instrument_id
 from src.core.etoro_client import EtoroClient
 from src.core.market_calendar import is_trading_day
-from src.core.state import Position, ProjectState
+from src.core.state import ProjectState
 from src.mcp_clients.mcp_manager import MCPManager
 
 load_dotenv()
@@ -298,36 +298,18 @@ class Orchestrator:
                 )
                 self.state.remove_position(pos.position_id)
 
-        # Add positions opened before last restart that aren't in our state
+        # Positions present on the broker but not in our state are NOT adopted —
+        # the bot only manages (reviews, trails stops on, closes) positions it
+        # opened itself. This account had 29 pre-existing manual positions when
+        # the bot was first connected; silently adopting them would put the bot
+        # in control of trades it never analysed. Log them for visibility only.
         known_ids = {p.position_id for p in self.state.open_positions}
-        for pid, item in broker_ids.items():
-            if pid in known_ids:
-                continue
-            try:
-                symbol = str(
-                    item.get("instrumentName", item.get("ticker", "UNKNOWN"))
-                ).upper()
-                opened_str = item.get("openDateTime", item.get("openDate", _utcnow().isoformat()))
-                opened_at = datetime.fromisoformat(
-                    opened_str.replace("Z", "+00:00") if isinstance(opened_str, str) else _utcnow().isoformat()
-                )
-                pos = Position(
-                    position_id=pid,
-                    instrument_id=str(item.get("instrumentId", "")),
-                    symbol=symbol,
-                    is_buy=bool(item.get("isBuy", True)),
-                    amount_usd=float(item.get("amount", item.get("investmentAmount", 0))),
-                    entry_rate=float(item.get("openRate", item.get("openPrice", 0))),
-                    stop_loss_pct=float(item.get("stopLoss", item.get("stopLossRate", 2.0))),
-                    opened_at=opened_at,
-                )
-                self.state.open_positions.append(pos)
-                logger.info(
-                    "Reconciled external position: %s %s opened=%s",
-                    "BUY" if pos.is_buy else "SELL", symbol, opened_at.date(),
-                )
-            except Exception as exc:
-                logger.warning("Could not reconcile position %s: %s", pid, exc)
+        foreign_ids = [pid for pid in broker_ids if pid not in known_ids]
+        if foreign_ids:
+            logger.info(
+                "%d broker position(s) not opened by this bot — left untouched: %s",
+                len(foreign_ids), foreign_ids,
+            )
 
         logger.info(
             "Reconciliation complete — %d position(s) in state", len(self.state.open_positions)
@@ -336,10 +318,7 @@ class Orchestrator:
 
     async def _get_balance(self) -> float:
         try:
-            data = await self.client.get_balance()
-            return float(
-                data.get("availableToTrade", data.get("balance", data.get("equity", 0)))
-            )
+            return await self.client.get_balance()
         except Exception as exc:
             logger.error("get_balance failed: %s", exc)
             return 0.0

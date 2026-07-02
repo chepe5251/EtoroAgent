@@ -33,6 +33,7 @@ class SizedOrder:
     instrument_id: str
     amount_usd: float
     stop_loss_pct: float
+    current_price: float
     atr: float
 
 
@@ -60,6 +61,7 @@ def size_position(
         instrument_id=instrument_id,
         amount_usd=amount_usd,
         stop_loss_pct=stop_loss_pct,
+        current_price=current_price,
         atr=atr,
     )
 
@@ -95,6 +97,7 @@ class ExecutionAgent:
                 amount_usd=order.amount_usd,
                 is_buy=is_buy,
                 stop_loss_pct=order.stop_loss_pct,
+                current_price=order.current_price,
                 trailing_stop=True,
             )
         except Exception as exc:

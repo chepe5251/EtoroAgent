@@ -5,6 +5,7 @@ __pycache__/
 *.egg-info/
 .env
 universe_cache.json
+state.json
 logs/
 *.log
 .DS_Store
