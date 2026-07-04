@@ -182,6 +182,7 @@ class Orchestrator:
             shortlist = await self.screening_agent.run(symbols)
         except Exception as exc:
             logger.error("Screening failed for %s: %s", region, exc, exc_info=True)
+            await self.notification_agent.send_critical_error(f"Screening failed for {region}: {exc}")
             shortlist = []
 
         if not shortlist:
@@ -228,6 +229,9 @@ class Orchestrator:
             return
 
         current_price, atr = await self._fetch_price_and_atr(symbol)
+        if current_price <= 0:
+            logger.warning("%s: no valid price data — skipping execution", symbol)
+            return
         order = size_position(thesis, instrument_id, balance, current_price, atr)
         logger.info(
             "%s: placing order amount=$%.2f stop=%.4f%% horizon=%dd",
@@ -241,18 +245,21 @@ class Orchestrator:
             await self.position_review_agent.review_all()
         except Exception as exc:
             logger.error("Position review error: %s", exc, exc_info=True)
+            await self.notification_agent.send_critical_error(f"Position review cycle failed: {exc}")
 
     async def _trailing_stop_cycle(self):
         try:
             await self.trailing_stop_agent.adjust_all()
         except Exception as exc:
             logger.error("Trailing stop cycle error: %s", exc, exc_info=True)
+            await self.notification_agent.send_critical_error(f"Trailing stop cycle failed: {exc}")
 
     async def _daily_summary(self):
         try:
             await self.notification_agent.send_daily_summary()
         except Exception as exc:
             logger.error("Daily summary error: %s", exc, exc_info=True)
+            await self.notification_agent.send_critical_error(f"Daily summary failed: {exc}")
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 

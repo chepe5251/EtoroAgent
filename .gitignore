@@ -6,6 +6,7 @@ __pycache__/
 .env
 universe_cache.json
 state.json
+trades.jsonl
 logs/
 *.log
 .DS_Store

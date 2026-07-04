@@ -93,6 +93,7 @@ class TrailingStopAgent:
             await self.client.update_stop_loss(
                 pos.position_id, pos.instrument_id, new_sl_price
             )
+            self.state.save()  # persist the tightened stop-loss
         except Exception as exc:
             # Revert in-memory change so we retry next cycle rather than silently
             # diverging from the broker's actual stop.

@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
+from src.core import trade_log
 from src.core.state import Position, ProjectState
 from src.core.thesis import TradingThesis
 
@@ -127,6 +128,15 @@ class ExecutionAgent:
         )
         self.state.open_positions.append(pos)
         self.state.save()  # persist immediately so state survives a crash
+        trade_log.log_open(
+            position_id=position_id,
+            symbol=symbol,
+            is_buy=is_buy,
+            amount_usd=order.amount_usd,
+            entry_rate=rate,
+            stop_loss_pct=order.stop_loss_pct,
+            horizon_days=pos.horizon_days,
+        )
         logger.info(
             "ExecutionAgent: position opened id=%s %s rate=%.4f horizon=%dd",
             position_id, symbol, rate, pos.horizon_days,
@@ -138,8 +148,8 @@ class ExecutionAgent:
         """Close a specific open position."""
         pos = next((p for p in self.state.open_positions if p.position_id == position_id), None)
         if not pos:
-            logger.warning("ExecutionAgent: position %s not found in state", position_id)
-            return False
+            logger.warning("ExecutionAgent: position %s not found in state, cannot close.", position_id)
+            return False # Added return statement to exit early if position is not found.
 
         logger.info("ExecutionAgent: closing %s (%s) — reason: %s", pos.symbol, position_id, reason)
         try:
@@ -158,12 +168,24 @@ class ExecutionAgent:
             pnl = (pos.entry_rate - close_rate) / pos.entry_rate * pos.amount_usd
 
         duration = _utcnow() - pos.opened_at
+        pos.current_rate = close_rate
         self.state.remove_position(position_id)
-        self.state.save()  # persist immediately
 
         from src.agents import risk_gate
         risk_gate.record_closed_pnl(self.state, pnl)
+        self.state.save()  # persist position removal + P&L update immediately
 
+        trade_log.log_close(
+            position_id=position_id,
+            symbol=pos.symbol,
+            is_buy=pos.is_buy,
+            amount_usd=pos.amount_usd,
+            entry_rate=pos.entry_rate,
+            close_rate=close_rate,
+            pnl=pnl,
+            duration_hours=duration.total_seconds() / 3600,
+            reason=reason,
+        )
         logger.info("ExecutionAgent: %s closed pnl=%.2f duration=%s", pos.symbol, pnl, duration)
         await self.notification_agent.send_position_closed(pos, pnl, duration)
         return True

@@ -13,7 +13,7 @@ import logging
 import os
 from typing import TYPE_CHECKING
 
-from src.core.state import Position, ProjectState
+from src.core.state import Position, ProjectState, get_hard_exit_days
 from src.core.thesis import TradingThesis
 from src.llm.react_runtime import ReActRuntime
 
@@ -24,7 +24,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_HARD_EXIT_DAYS = int(os.getenv("SWING_HARD_EXIT_DAYS", "20"))
 _REVIEW_MIN_CONFIDENCE = float(os.getenv("REVIEW_MIN_CONFIDENCE", "0.55"))
 
 _REVIEW_SYSTEM_PROMPT = """\
@@ -76,11 +75,12 @@ class PositionReviewAgent:
                 await self._review_position(pos)
             except Exception as exc:
                 logger.error("Error reviewing position %s: %s", pos.symbol, exc, exc_info=True)
+                await self.notification_agent.send_critical_error(f"Error reviewing position {pos.symbol}: {exc}")
 
     async def _review_position(self, pos: Position):
         logger.info(
             "PositionReview: %s — day %d/%d (horizon=%d)",
-            pos.symbol, pos.days_open, _HARD_EXIT_DAYS, pos.horizon_days,
+            pos.symbol, pos.days_open, get_hard_exit_days(), pos.horizon_days,
         )
 
         # ── Hard exit: 20-day absolute limit (deterministic) ──────────────
@@ -155,7 +155,10 @@ class PositionReviewAgent:
     async def _close(self, pos: Position, reason: str):
         """Close a position and notify."""
         try:
-            await self.execution_agent.close_position(pos.position_id, reason=reason)
+            closed = await self.execution_agent.close_position(pos.position_id, reason=reason)
+            if not closed:
+                logger.warning("PositionReview: close failed for %s — %s", pos.symbol, reason)
+                return
             logger.info("PositionReview: closed %s — %s", pos.symbol, reason)
         except Exception as exc:
             logger.error("PositionReview: close failed for %s: %s", pos.symbol, exc)
@@ -172,3 +175,4 @@ class PositionReviewAgent:
         )
         # Update in memory; actual API update handled by trailing stop agent
         pos.stop_loss_pct = min(pos.stop_loss_pct, new_stop_pct)
+        self.state.save()

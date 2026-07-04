@@ -69,6 +69,25 @@ INSTRUMENT_RESPONSE = {"instrumentId": 42, "symbol": "BTC", "displayName": "Bitc
 
 PORTFOLIO_RESPONSE = {"clientPortfolio": {"positions": [], "credit": 10000.0}}
 
+PORTFOLIO_WITH_RATE_RESPONSE = {
+    "clientPortfolio": {
+        "positions": [
+            {
+                "positionID": 9001,
+                "instrumentID": 42,
+                "isBuy": True,
+                "openRate": 50000.0,
+                "currentRate": 50500.0,
+                "stopLossRate": 49000.0,
+                "takeProfitRate": 55000.0,
+                "amount": 200.0,
+                "leverage": 1,
+            }
+        ],
+        "credit": 10000.0,
+    },
+}
+
 CREATE_ORDER_RESPONSE = {"token": "tok-1", "orderId": 555, "referenceId": "ref-1"}
 
 ORDER_LOOKUP_EXECUTED_RESPONSE = {
@@ -149,6 +168,19 @@ async def test_get_balance(mock_client):
 async def test_get_portfolio(mock_client):
     portfolio = await mock_client.get_portfolio()
     assert portfolio == []
+
+
+@pytest.mark.asyncio
+async def test_get_portfolio_preserves_current_rate():
+    routes = {
+        ("GET", "/api/v1/trading/info/demo/portfolio"): (200, PORTFOLIO_WITH_RATE_RESPONSE),
+    }
+    transport = MockTransport(routes)
+    client = EtoroClient()
+    client._client = httpx.AsyncClient(transport=transport, timeout=10.0)
+
+    portfolio = await client.get_portfolio()
+    assert portfolio[0]["currentRate"] == 50500.0
 
 
 @pytest.mark.asyncio

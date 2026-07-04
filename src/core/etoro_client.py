@@ -304,6 +304,7 @@ class EtoroClient:
                 "instrumentId": str(p.get("instrumentID")),
                 "isBuy": p.get("isBuy"),
                 "openRate": p.get("openRate"),
+                "currentRate": p.get("currentRate", p.get("rate")),
                 "stopLossRate": p.get("stopLossRate"),
                 "takeProfitRate": p.get("takeProfitRate"),
                 "amount": p.get("amount"),

@@ -3,6 +3,8 @@ Tests for PositionReviewAgent.
 Focus: 20-day hard exit limit (deterministic), LLM verdict routing.
 """
 import sys
+import importlib
+import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -166,6 +168,32 @@ async def test_llm_tighten_stop_adjusts_stop():
 
 
 @pytest.mark.asyncio
+async def test_tighten_stop_persists_state(monkeypatch):
+    pos = _make_position(days_open=8, atr=1000.0, entry_rate=50000.0)
+    state = _make_state(pos)
+    agent = _make_agent(state)
+    save = MagicMock()
+    monkeypatch.setattr(state, "save", save)
+
+    await agent._tighten(pos, 0.5, "tighten")
+
+    save.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_close_does_not_log_success_when_execution_fails(caplog):
+    pos = _make_position(days_open=20)
+    state = _make_state(pos)
+    agent = _make_agent(state)
+    agent.execution_agent.close_position = AsyncMock(return_value=False)
+
+    with caplog.at_level(logging.INFO):
+        await agent._close(pos, reason="test failure")
+
+    assert "closed BTC" not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_no_llm_verdict_skips_action():
     """If LLM returns None (parse error), no action taken."""
     pos = _make_position(days_open=5)
@@ -270,3 +298,23 @@ def test_risk_gate_approves_valid_horizon():
     state = ProjectState()
     approved, _ = risk_gate.validate(thesis, state, balance=10000.0)
     assert approved is True
+
+
+def test_hard_exit_days_is_configurable(monkeypatch):
+    monkeypatch.setenv("SWING_HARD_EXIT_DAYS", "25")
+    import src.core.state as state_module
+
+    reloaded = importlib.reload(state_module)
+    pos = reloaded.Position(
+        position_id="pos_cfg",
+        instrument_id="instr_cfg",
+        symbol="BTC",
+        is_buy=True,
+        amount_usd=1000.0,
+        entry_rate=50000.0,
+        stop_loss_pct=2.0,
+        opened_at=_utcnow() - timedelta(days=20),
+    )
+
+    assert reloaded.get_hard_exit_days() == 25
+    assert pos.is_past_hard_exit is False
