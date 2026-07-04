@@ -150,7 +150,7 @@ def _make_raw_candles(n: int, start_date: str = "2020-01-01") -> list[dict]:
 
 
 def run_async(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 @pytest.fixture
@@ -260,8 +260,8 @@ def test_fetch_symbol_warns_if_too_few_bars(mock_client, tmp_path, caplog):
 
 def test_get_candles_uses_correct_endpoint():
     """
-    EtoroClient.get_candles must call _request with
-    path='/market-data/instruments/history/candles'.
+    EtoroClient.get_candles must call _request with the path-parameterised
+    candles endpoint: /api/v1/market-data/instruments/{id}/history/candles/{direction}/{interval}/{count}.
     """
     from src.core.etoro_client import EtoroClient
 
@@ -277,8 +277,7 @@ def test_get_candles_uses_correct_endpoint():
 
         async def fake_request(method, path, **kwargs):
             captured_path["path"] = path
-            captured_path["params"] = kwargs.get("params", {})
-            return {"data": []}
+            return {"candles": []}
 
         client._request = fake_request
 
@@ -286,13 +285,13 @@ def test_get_candles_uses_correct_endpoint():
         with patch("src.core.etoro_client._cache_id", return_value="99"):
             run_async(client.get_candles("AAPL", interval="D1", count=100))
 
-    assert captured_path.get("path") == "/market-data/instruments/history/candles", (
-        f"Wrong endpoint: {captured_path.get('path')}"
-    )
+    assert captured_path.get("path") == (
+        "/api/v1/market-data/instruments/99/history/candles/asc/OneDay/100"
+    ), f"Wrong endpoint: {captured_path.get('path')}"
 
 
 def test_get_candles_translates_D1_to_OneDay():
-    """Interval 'D1' must be translated to 'OneDay' in the request params."""
+    """Interval 'D1' must be translated to 'OneDay' in the request path."""
     from src.core.etoro_client import EtoroClient
 
     with patch.dict("os.environ", {
@@ -303,22 +302,22 @@ def test_get_candles_translates_D1_to_OneDay():
         captured = {}
 
         async def fake_request(method, path, **kwargs):
-            captured.update(kwargs.get("params", {}))
-            return {"data": []}
+            captured["path"] = path
+            return {"candles": []}
 
         client._request = fake_request
 
         with patch("src.core.etoro_client._cache_id", return_value="42"):
             run_async(client.get_candles("MSFT", interval="D1", count=100))
 
-    assert captured.get("interval") == "OneDay", (
-        f"Expected interval='OneDay', got {captured.get('interval')!r}"
+    assert "/OneDay/" in captured["path"], (
+        f"Expected 'OneDay' in path, got {captured['path']!r}"
     )
 
 
 def test_get_candles_uses_instrument_id_not_ticker():
     """
-    The request params must include 'instrumentId' (numeric), not the raw ticker.
+    The request path must contain the numeric instrumentId, not the raw ticker.
     """
     from src.core.etoro_client import EtoroClient
 
@@ -330,8 +329,8 @@ def test_get_candles_uses_instrument_id_not_ticker():
         captured = {}
 
         async def fake_request(method, path, **kwargs):
-            captured.update(kwargs.get("params", {}))
-            return []
+            captured["path"] = path
+            return {"candles": []}
 
         client._request = fake_request
 
@@ -339,9 +338,8 @@ def test_get_candles_uses_instrument_id_not_ticker():
         with patch("src.core.etoro_client._cache_id", return_value="777"):
             run_async(client.get_candles("TSLA", interval="D1", count=50))
 
-    assert "instrumentId" in captured, "instrumentId param missing from request"
-    assert captured["instrumentId"] == "777"
-    assert "TSLA" not in str(captured.get("instrumentId", "")), (
+    assert "/777/" in captured["path"], "instrumentId missing from request path"
+    assert "TSLA" not in captured["path"], (
         "Request must use numeric instrumentId, not raw ticker"
     )
 
@@ -379,16 +377,16 @@ def test_get_candles_limit_capped_at_1000():
         captured = {}
 
         async def fake_request(method, path, **kwargs):
-            captured.update(kwargs.get("params", {}))
-            return []
+            captured["path"] = path
+            return {"candles": []}
 
         client._request = fake_request
 
         with patch("src.core.etoro_client._cache_id", return_value="1"):
             run_async(client.get_candles("AAPL", interval="D1", count=9999))
 
-    assert captured.get("limit") <= 1000, (
-        f"limit should be capped at 1000, got {captured.get('limit')}"
+    assert captured["path"].endswith("/1000"), (
+        f"limit should be capped at 1000, got path {captured['path']!r}"
     )
 
 

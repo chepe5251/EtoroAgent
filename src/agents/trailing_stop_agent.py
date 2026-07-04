@@ -88,12 +88,12 @@ class TrailingStopAgent:
             old_pct, new_sl_pct, current, pos.entry_rate, gain, atr,
         )
 
-        # Push the new stop to the broker.
-        # NOTE: verify update_stop_loss() endpoint/payload with eToro API docs.
+        # Push the new stop to the broker (absolute rate — the API has no % field).
         try:
             await self.client.update_stop_loss(
-                pos.position_id, pos.instrument_id, pos.stop_loss_pct
+                pos.position_id, pos.instrument_id, new_sl_price
             )
+            self.state.save()  # persist the tightened stop-loss
         except Exception as exc:
             # Revert in-memory change so we retry next cycle rather than silently
             # diverging from the broker's actual stop.

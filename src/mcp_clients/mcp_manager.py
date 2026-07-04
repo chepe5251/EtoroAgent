@@ -22,12 +22,20 @@ logger = logging.getLogger(__name__)
 _SERVERS_DIR = Path(__file__).parent.parent / "mcp_servers"
 
 # All MCP servers that will be started. Order doesn't matter.
-_DEFAULT_SERVERS: dict[str, str] = {
+# Value is either a python script filename (relative to _SERVERS_DIR, run with
+# the current interpreter) or a {"command", "args", "env"} spec for a
+# non-python server (e.g. an npx-launched Node MCP server).
+_DEFAULT_SERVERS: dict[str, str | dict] = {
     "etoro":       "etoro_server.py",
     "indicators":  "indicators_server.py",
     "finnhub":     "finnhub_server.py",
     "cryptopanic": "cryptopanic_server.py",
     "reddit":      "reddit_server.py",
+    "exa": {
+        "command": "npx",
+        "args": ["-y", "exa-mcp-server"],
+        "env": {"EXA_API_KEY": os.getenv("EXA_API_KEY", "")},
+    },
 }
 
 
@@ -43,7 +51,7 @@ class MCPManager:
         await manager.stop()
     """
 
-    def __init__(self, server_scripts: dict[str, str] | None = None):
+    def __init__(self, server_scripts: dict[str, str | dict] | None = None):
         # name → script filename (relative to _SERVERS_DIR)
         self._server_scripts = server_scripts or _DEFAULT_SERVERS
         # tool_name → (ClientSession, tool_schema)
@@ -60,19 +68,25 @@ class MCPManager:
             return
         await self._exit_stack.__aenter__()
 
-        env = {**os.environ, "PYTHONPATH": str(Path(__file__).parent.parent.parent)}
+        base_env = {**os.environ, "PYTHONPATH": str(Path(__file__).parent.parent.parent)}
 
-        for name, script_file in self._server_scripts.items():
-            script_path = _SERVERS_DIR / script_file
-            if not script_path.exists():
-                logger.warning("MCP server script not found: %s — skipping", script_path)
-                continue
-
-            params = StdioServerParameters(
-                command=sys.executable,
-                args=[str(script_path)],
-                env=env,
-            )
+        for name, spec in self._server_scripts.items():
+            if isinstance(spec, dict):
+                params = StdioServerParameters(
+                    command=spec["command"],
+                    args=spec.get("args", []),
+                    env={**base_env, **spec.get("env", {})},
+                )
+            else:
+                script_path = _SERVERS_DIR / spec
+                if not script_path.exists():
+                    logger.warning("MCP server script not found: %s — skipping", script_path)
+                    continue
+                params = StdioServerParameters(
+                    command=sys.executable,
+                    args=[str(script_path)],
+                    env=base_env,
+                )
             try:
                 read, write = await self._exit_stack.enter_async_context(
                     stdio_client(params)

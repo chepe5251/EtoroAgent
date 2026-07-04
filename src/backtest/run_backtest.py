@@ -58,6 +58,8 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Force re-download even if cache exists")
     p.add_argument("--years", type=int, default=5,
                    help="Years of history to fetch (default 5)")
+    p.add_argument("--months", type=int, default=None,
+                   help="Filter data to only use the last N months for the backtest")
     p.add_argument("--split", type=float, default=0.7,
                    help="IS/OOS split ratio (default 0.7)")
     p.add_argument("--walk-forward", action="store_true",
@@ -86,13 +88,11 @@ async def _maybe_fetch(symbols: list[str], args: argparse.Namespace) -> None:
         logger.error("Cannot import EtoroClient: %s", e)
         sys.exit(1)
 
-    username = os.getenv("ETORO_USER", "")
-    password = os.getenv("ETORO_PASS", "")
-    if not username or not password:
-        logger.error("ETORO_USER and ETORO_PASS must be set in .env to fetch data")
+    if not os.getenv("ETORO_PUBLIC_API_KEY") or not os.getenv("ETORO_USER_KEY"):
+        logger.error("ETORO_PUBLIC_API_KEY and ETORO_USER_KEY must be set in .env to fetch data")
         sys.exit(1)
 
-    async with EtoroClient(username, password) as client:
+    async with EtoroClient() as client:
         logger.info("Fetching candles for: %s", symbols)
         await bt_data.fetch_all(
             symbols, client,
@@ -181,6 +181,8 @@ def main() -> None:
     print(f"  Risk/trade : {cfg.risk_per_trade_pct}%")
     print(f"  Equity     : ${cfg.initial_equity:,.0f}")
     print(f"  IS split   : {args.split:.0%} / {1-args.split:.0%}")
+    if args.months:
+        print(f"  Months     : Last {args.months} months")
     print(f"  Symbols    : {' '.join(symbols)}")
     print(f"{'#' * 56}")
 
@@ -193,6 +195,14 @@ def main() -> None:
         if df is None:
             print(f"\n[{symbol}] SKIP — no cached data (run with --fetch)")
             continue
+
+        if args.months:
+            import pandas as pd
+            cutoff = df.index[-1] - pd.DateOffset(months=args.months)
+            df = df[df.index >= cutoff]
+            if len(df) < 20: # arbitrary minimum
+                print(f"\n[{symbol}] SKIP — too few bars after --months filter")
+                continue
 
         if args.walk_forward:
             folds = bt_engine.walk_forward(df, cfg, symbol, asset_class=asset_class)

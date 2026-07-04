@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -10,6 +11,10 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 _STATE_FILE = Path("state.json")
+
+
+def get_hard_exit_days() -> int:
+    return int(os.getenv("SWING_HARD_EXIT_DAYS", "20"))
 
 
 def _utcnow() -> datetime:
@@ -41,7 +46,7 @@ class Position:
 
     @property
     def is_past_hard_exit(self) -> bool:
-        return self.days_open >= 20
+        return self.days_open >= get_hard_exit_days()
 
     def to_dict(self) -> dict:
         return {
@@ -96,6 +101,7 @@ class ProjectState:
             self.is_risk_blocked = False
             self.risk_block_reason = ""
             self._daily_reset_date = today
+            self.save()
             return True
         return False
 
@@ -111,6 +117,7 @@ class ProjectState:
     def block(self, reason: str):
         self.is_risk_blocked = True
         self.risk_block_reason = reason
+        self.save()
 
     # ── Persistence ────────────────────────────────────────────────────────────
 

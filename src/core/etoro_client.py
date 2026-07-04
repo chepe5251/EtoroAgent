@@ -13,32 +13,23 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-BASE_URL = "https://public-api.etoro.com/api/v1"
+BASE_URL = "https://public-api.etoro.com"
 
 # Module-level alias so tests can patch via 'src.core.etoro_client._cache_id'
 from src.config.universe import get_instrument_id as _cache_id  # noqa: E402
 
 # ── Interval translation table ─────────────────────────────────────────────────
-# Source confirmed: api-portal.etoro.com / builders.etoro.com
-#   "OneDay" is confirmed for daily candles.
-#
-# NOTE (manual verification required):
-#   Sub-day intervals ("OneHour", "FifteenMinutes", etc.) are educated guesses
-#   based on common broker API naming conventions.  Verify the full list of
-#   accepted `interval` values by calling the endpoint with each candidate and
-#   checking for a 400/422 error.  An alternative is to inspect the Network tab
-#   in the eToro web app while loading a chart.
+# Confirmed against https://api-portal.etoro.com/api-reference/openapi.json
+# (candlesResponse endpoint `interval` enum).
 _INTERVAL_MAP: dict[str, str] = {
-    # Our internal codes → eToro API values
-    "D1":  "OneDay",         # confirmed
-    "W1":  "OneWeek",        # NOTE: unverified — may be "Weekly" or unsupported
-    "H1":  "OneHour",        # NOTE: unverified
-    "H4":  "FourHours",      # NOTE: unverified
-    "M60": "OneHour",        # alias
-    "M15": "FifteenMinutes", # NOTE: unverified
-    "M5":  "FiveMinutes",    # NOTE: unverified
-    "M1":  "OneMinute",      # NOTE: unverified
-    # Pass-through if already in eToro format
+    "D1":  "OneDay",
+    "W1":  "OneWeek",
+    "H1":  "OneHour",
+    "H4":  "FourHours",
+    "M60": "OneHour",
+    "M15": "FifteenMinutes",
+    "M5":  "FiveMinutes",
+    "M1":  "OneMinute",
     "OneDay":          "OneDay",
     "OneWeek":         "OneWeek",
     "OneHour":         "OneHour",
@@ -73,13 +64,24 @@ class RateLimiter:
                 await asyncio.sleep(sleep_for)
 
 
+class OrderRejected(RuntimeError):
+    """Raised when eToro rejects or cancels an order (non-zero errorCode)."""
+
+
 class EtoroClient:
-    """Async HTTP client for the eToro Public API."""
+    """Async HTTP client for the eToro Public API.
+
+    Endpoints verified against https://api-portal.etoro.com/api-reference/openapi.json
+    (eToro Api v1.279.0). Demo vs. real is NOT a URL prefix uniformly — each
+    endpoint family has its own convention (some insert "demo" mid-path, some
+    have no distinct demo path at all). See per-method comments.
+    """
 
     def __init__(self):
         self.api_key = os.environ["ETORO_PUBLIC_API_KEY"]
         self.user_key = os.environ["ETORO_USER_KEY"]
         self.mode = os.getenv("ETORO_MODE", "demo").lower()  # demo | real
+        self.is_demo = self.mode != "real"
 
         self._shared_limiter = RateLimiter(max_calls=60, period=60.0)
         self._market_limiter = RateLimiter(max_calls=120, period=60.0)
@@ -105,9 +107,6 @@ class EtoroClient:
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
-
-    def _execution_prefix(self) -> str:
-        return "demo" if self.mode == "demo" else "real"
 
     async def _request(
         self,
@@ -184,38 +183,17 @@ class EtoroClient:
         direction: str = "asc",
     ) -> list[dict]:
         """
-        Fetch OHLCV candles for a symbol using the real eToro market-data endpoint.
+        Fetch OHLCV candles for a symbol.
 
-        Endpoint: GET /market-data/instruments/history/candles
-        Params:   instrumentId (numeric), direction (asc|desc), interval, limit (≤1000)
+        Endpoint: GET /api/v1/market-data/instruments/{instrumentId}/history/candles/{direction}/{interval}/{candlesCount}
+        (path parameters, not query — candlesCount is capped at 1000 server-side).
 
         The `symbol` string is resolved to a numeric instrumentId via the universe
-        cache first; if not cached, a live API call to /instruments is made.
+        cache first; if not cached, a live API call is made.
         Returns an empty list (and logs a warning) if instrumentId cannot be resolved.
-
-        Interval translation: "D1" → "OneDay" via _INTERVAL_MAP.
-        Unknown intervals are passed through unchanged (server will 400 if invalid).
-
-        NOTE — Pagination limit:
-          The eToro API accepts limit≤1000 per request (~4 trading years for daily).
-          A `from`/`to` date-range parameter is NOT documented in the public portal.
-          For 5-year (≈1260 bar) requests, this method is called with count=1000,
-          which may return less data than requested.  Verify in demo whether:
-            (a) a `from` or `startDate` param is accepted (would enable pagination),
-            (b) `direction=asc` reliably returns the oldest available bars,
-            (c) max historical depth (some brokers cap at 2-3 years for free tiers).
-          Until confirmed, data.fetch_symbol() warns when <_MIN_BARS_FOR_BACKTEST
-          are returned.
-
-        NOTE — Response field names:
-          Confirmed field mapping is unknown at writing time (no sandbox available).
-          _normalise_candle() in data.py attempts multiple key variants.  Verify the
-          actual JSON response in demo and update _ETORO_FIELD_MAP if needed.
         """
-        # Translate interval code
         etoro_interval = _INTERVAL_MAP.get(interval, interval)
 
-        # Resolve symbol → numeric instrumentId (cache first, then live API)
         instrument_id: Optional[str] = _cache_id(symbol)
         if instrument_id is None:
             instrument_id = await self.get_instrument_id(symbol)
@@ -225,68 +203,118 @@ class EtoroClient:
             )
             return []
 
+        candles_count = min(count, 1000)
         data = await self._request(
             "GET",
-            "/market-data/instruments/history/candles",
+            f"/api/v1/market-data/instruments/{instrument_id}/history/candles/"
+            f"{direction}/{etoro_interval}/{candles_count}",
             limiter=self._market_limiter,
-            params={
-                "instrumentId": instrument_id,
-                "direction": direction,
-                "interval": etoro_interval,
-                "limit": min(count, 1000),
-            },
         )
 
-        # Unwrap envelope: {"data": [...]} or bare list
-        candles = data.get("data", data) if isinstance(data, dict) else data
-        if not isinstance(candles, list):
-            logger.warning(
-                "get_candles: unexpected response type %s for %s",
-                type(candles).__name__, symbol,
-            )
+        # Response shape: {"interval": ..., "candles": [{"instrumentId": ..., "candles": [...]}]}
+        groups = data.get("candles", []) if isinstance(data, dict) else []
+        if not groups:
+            logger.debug("get_candles: %s returned no candle groups", symbol)
             return []
+        candles = groups[0].get("candles", [])
         logger.debug("get_candles: %s returned %d raw candles", symbol, len(candles))
         return candles
 
     async def get_rates(self, symbols: list[str]) -> dict[str, dict]:
+        """Fetch live rates. Endpoint: GET /api/v1/market-data/instruments/rates
+        (takes numeric instrumentIds, not symbols — resolved via the universe cache)."""
+        id_by_symbol: dict[str, str] = {}
+        for symbol in symbols:
+            instrument_id = _cache_id(symbol)
+            if instrument_id is None:
+                instrument_id = await self.get_instrument_id(symbol)
+            if instrument_id is not None:
+                id_by_symbol[symbol] = instrument_id
+
+        if not id_by_symbol:
+            return {}
+
         data = await self._request(
             "GET",
-            "/rates",
+            "/api/v1/market-data/instruments/rates",
             limiter=self._market_limiter,
-            params={"instruments": ",".join(symbols)},
+            params={"instrumentIds": list(id_by_symbol.values())},
         )
-        rates = data.get("data", data) if isinstance(data, dict) else data
-        if isinstance(rates, list):
-            return {item["instrumentName"]: item for item in rates}
-        return rates
+        rates = data.get("rates", []) if isinstance(data, dict) else []
+        rate_by_id = {str(item["instrumentID"]): item for item in rates}
+        return {
+            symbol: rate_by_id[instrument_id]
+            for symbol, instrument_id in id_by_symbol.items()
+            if instrument_id in rate_by_id
+        }
 
     async def get_instrument_id(self, symbol: str) -> Optional[str]:
-        data = await self._request(
-            "GET",
-            "/instruments",
-            limiter=self._market_limiter,
-            params={"filter": symbol},
-        )
-        instruments = data.get("data", data) if isinstance(data, dict) else data
-        if isinstance(instruments, list) and instruments:
-            return str(instruments[0].get("instrumentId", instruments[0].get("id")))
+        """Endpoint: GET /api/v1/instruments/{symbol} — exact-symbol lookup."""
+        try:
+            data = await self._request(
+                "GET",
+                f"/api/v1/instruments/{symbol}",
+                limiter=self._market_limiter,
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                return None
+            raise
+        if isinstance(data, dict) and "instrumentId" in data:
+            return str(data["instrumentId"])
         return None
 
     # ------------------------------------------------------------------
-    # Account endpoints (mode-aware)
+    # Account endpoints
     # ------------------------------------------------------------------
 
-    async def get_balance(self) -> dict:
-        data = await self._request("GET", f"/{self._execution_prefix()}/balance")
-        return data.get("data", data) if isinstance(data, dict) else data
+    async def _get_client_portfolio(self) -> dict:
+        """Endpoint: GET /api/v1/trading/info/portfolio (real) or
+        GET /api/v1/trading/info/demo/portfolio (demo). Shared by get_balance()
+        and get_portfolio() since both fields live in the same response."""
+        path = (
+            "/api/v1/trading/info/demo/portfolio"
+            if self.is_demo
+            else "/api/v1/trading/info/portfolio"
+        )
+        data = await self._request("GET", path)
+        return data.get("clientPortfolio", {}) if isinstance(data, dict) else {}
+
+    async def get_balance(self) -> float:
+        """Tradable USD balance.
+
+        NOTE: GET /api/v1/balances requires the 'etoro-public:money.balance:read'
+        scope, which is not grantable through the standard API Key Management UI
+        (confirmed 403 InsufficientPermissions even with a fresh Read+Write real
+        key). The portfolio endpoint's `credit` field ("Available trading balance
+        in USD") is accessible with normal trade scopes and is used instead.
+        """
+        client_portfolio = await self._get_client_portfolio()
+        return float(client_portfolio.get("credit", 0))
 
     async def get_portfolio(self) -> list[dict]:
-        data = await self._request("GET", f"/{self._execution_prefix()}/portfolio")
-        portfolio = data.get("data", data) if isinstance(data, dict) else data
-        return portfolio if isinstance(portfolio, list) else []
+        """Returns positions normalised to {positionId, instrumentId, isBuy, openRate,
+        stopLossRate, takeProfitRate, amount, leverage} — lower-camel keys, matching
+        what the rest of the codebase expects."""
+        client_portfolio = await self._get_client_portfolio()
+        positions = client_portfolio.get("positions", [])
+        return [
+            {
+                "positionId": str(p.get("positionID")),
+                "instrumentId": str(p.get("instrumentID")),
+                "isBuy": p.get("isBuy"),
+                "openRate": p.get("openRate"),
+                "currentRate": p.get("currentRate", p.get("rate")),
+                "stopLossRate": p.get("stopLossRate"),
+                "takeProfitRate": p.get("takeProfitRate"),
+                "amount": p.get("amount"),
+                "leverage": p.get("leverage"),
+            }
+            for p in positions
+        ]
 
     # ------------------------------------------------------------------
-    # Execution endpoints (mode-aware)
+    # Execution endpoints
     # ------------------------------------------------------------------
 
     async def open_position(
@@ -295,54 +323,114 @@ class EtoroClient:
         amount_usd: float,
         is_buy: bool,
         stop_loss_pct: float,
+        current_price: float,
         trailing_stop: bool = True,
     ) -> dict:
-        """Open a new position.
+        """Open a new position via the unified order endpoint (POST
+        /api/v2/trading/execution/orders, or .../demo/orders in demo mode).
 
-        NOTE: The `stopLoss` field semantics must be verified against the eToro
-        Public API docs before using in `real` mode.  Many broker APIs expect a
-        rate (absolute price) in `stopLossRate`, not a percentage.  Validate
-        this in demo mode by checking the actual stop placement in the eToro UI
-        after opening a test position.
+        That endpoint is asynchronous: it only returns an orderId, not the fill.
+        We poll GET .../orders:lookup?orderId=... until the order reaches a
+        terminal state, then read the resulting position's id and fill price.
+
+        stop_loss_pct is a % distance from current_price — converted here to the
+        absolute stopLossRate the API requires (there is no percentage field).
         """
+        if is_buy:
+            stop_loss_rate = current_price * (1 - stop_loss_pct / 100)
+        else:
+            stop_loss_rate = current_price * (1 + stop_loss_pct / 100)
+
         payload = {
-            "instrumentId": instrument_id,
+            "action": "open",
+            "transaction": "buy" if is_buy else "sellShort",
+            "instrumentId": int(instrument_id),
+            "orderType": "mkt",
+            "leverage": 1,
             "amount": amount_usd,
-            "isBuy": is_buy,
-            "stopLoss": round(stop_loss_pct, 4),  # verify: % vs absolute rate vs $amount
-            "trailingStop": trailing_stop,
+            "orderCurrency": "usd",
+            "stopLossRate": round(stop_loss_rate, 6),
+            "stopLossType": "trailing" if trailing_stop else "fixed",
         }
-        data = await self._request(
-            "POST",
-            f"/{self._execution_prefix()}/positions",
-            json=payload,
+        create_path = (
+            "/api/v2/trading/execution/demo/orders"
+            if self.is_demo
+            else "/api/v2/trading/execution/orders"
         )
-        return data.get("data", data) if isinstance(data, dict) else data
+        created = await self._request("POST", create_path, json=payload)
+        order_id = created.get("orderId") if isinstance(created, dict) else None
+        if order_id is None:
+            raise RuntimeError(f"open_position: no orderId in response: {created}")
+
+        info = await self._await_order_fill(order_id)
+        executions = info.get("positionExecutions") or []
+        if not executions:
+            raise OrderRejected(f"open_position: order {order_id} has no position executions: {info}")
+        execution = executions[0]
+        return {
+            "positionId": str(execution.get("positionId")),
+            "openRate": execution.get("openingData", {}).get("avgPrice", 0),
+        }
+
+    async def _await_order_fill(
+        self, order_id: int, attempts: int = 10, delay: float = 1.0
+    ) -> dict:
+        """Poll orders:lookup until the order reaches a terminal status.
+        status.id: 1 = Executed, 2 = Cancelled, 3 = Rejected (per API docs)."""
+        lookup_path = (
+            "/api/v2/trading/info/demo/orders:lookup"
+            if self.is_demo
+            else "/api/v2/trading/info/orders:lookup"
+        )
+        last_info: dict = {}
+        for _ in range(attempts):
+            last_info = await self._request(
+                "GET", lookup_path, params={"orderId": order_id}
+            )
+            status = last_info.get("status", {}) if isinstance(last_info, dict) else {}
+            status_id = status.get("id")
+            if status_id == 1:
+                return last_info
+            if status_id in (2, 3):
+                raise OrderRejected(
+                    f"order {order_id} {status.get('name')}: {status.get('errorMessage')}"
+                )
+            await asyncio.sleep(delay)
+        raise TimeoutError(f"order {order_id} did not reach a terminal state in time: {last_info}")
 
     async def close_position(self, position_id: str, instrument_id: str) -> dict:
-        data = await self._request(
-            "DELETE",
-            f"/{self._execution_prefix()}/positions/{position_id}",
-            params={"instrumentId": instrument_id},
+        """Endpoint: POST /api/v1/trading/execution/market-close-orders/positions/{positionId}
+        (or .../demo/market-close-orders/... in demo mode). Omitting UnitsToDeduct
+        closes the entire position."""
+        path = (
+            f"/api/v1/trading/execution/demo/market-close-orders/positions/{position_id}"
+            if self.is_demo
+            else f"/api/v1/trading/execution/market-close-orders/positions/{position_id}"
         )
-        return data.get("data", data) if isinstance(data, dict) else data
+        data = await self._request(
+            "POST",
+            path,
+            json={"InstrumentId": int(instrument_id)},
+        )
+        return data if isinstance(data, dict) else {}
 
     async def update_stop_loss(
-        self, position_id: str, instrument_id: str, new_stop: float
+        self, position_id: str, instrument_id: str, new_stop_rate: float
     ) -> dict:
         """Update the stop loss on an open position.
 
-        NOTE: This endpoint and payload format must be verified against the eToro
-        Public API docs.  The exact field name and expected unit (%, rate, amount)
-        may differ.  Test in demo mode and confirm in the UI before enabling in real.
+        Endpoint: PATCH /api/v2/trading/positions/{positionId}
+        (or /api/v2/trading/demo/positions/{positionId} in demo mode).
+        new_stop_rate must be an absolute price (the API has no percentage field).
         """
-        payload = {
-            "instrumentId": instrument_id,
-            "stopLoss": round(new_stop, 4),
-        }
-        data = await self._request(
-            "PUT",
-            f"/{self._execution_prefix()}/positions/{position_id}",
-            json=payload,
+        path = (
+            f"/api/v2/trading/demo/positions/{position_id}"
+            if self.is_demo
+            else f"/api/v2/trading/positions/{position_id}"
         )
-        return data.get("data", data) if isinstance(data, dict) else data
+        data = await self._request(
+            "PATCH",
+            path,
+            json={"stopLossRate": round(new_stop_rate, 6), "stopLossType": "fixed"},
+        )
+        return data if isinstance(data, dict) else {}
