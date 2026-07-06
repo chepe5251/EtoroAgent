@@ -58,6 +58,15 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Force re-download even if cache exists")
     p.add_argument("--years", type=int, default=5,
                    help="Years of history to fetch (default 5)")
+    p.add_argument("--interval", choices=["D1", "H4", "H1"], default="D1",
+                   help="Candle interval (default D1). NOTE: eToro caps every "
+                        "request at 1000 bars with no pagination — H4 gets ~8 "
+                        "months of real history, H1 gets ~6 weeks, regardless "
+                        "of --years.")
+    p.add_argument("--max-hold-days", type=int, default=None,
+                   help="Hard time-limit exit, in BARS of the chosen --interval. "
+                        "Default: 20 bars for D1 (=20 days), auto-scaled to the "
+                        "same ~20-calendar-day window for H4/H1.")
     p.add_argument("--months", type=int, default=None,
                    help="Filter data to only use the last N months for the backtest")
     p.add_argument("--split", type=float, default=0.7,
@@ -114,11 +123,12 @@ async def _maybe_fetch(symbols: list[str], args: argparse.Namespace) -> None:
         sys.exit(1)
 
     async with EtoroClient() as client:
-        logger.info("Fetching candles for: %s", symbols)
+        logger.info("Fetching %s candles for: %s", args.interval, symbols)
         await bt_data.fetch_all(
             symbols, client,
             years=args.years,
             force=args.force_fetch,
+            interval=args.interval,
         )
 
 
@@ -193,6 +203,9 @@ def main() -> None:
 
     asyncio.run(_maybe_fetch(symbols, args))
 
+    bars_per_day = bt_data._BARS_PER_DAY.get(args.interval, 1)
+    max_hold_days = args.max_hold_days if args.max_hold_days is not None else 20 * bars_per_day
+
     cfg = bt_engine.BacktestConfig(
         initial_equity=args.equity,
         risk_per_trade_pct=args.risk_pct,
@@ -208,13 +221,16 @@ def main() -> None:
         structure_swing_k=args.structure_swing_k,
         exit_mode=args.exit,
         leverage=args.leverage,
+        max_hold_days=max_hold_days,
     )
 
     print(f"\n{'#' * 56}")
     print(f"  etoroBot Backtester")
+    print(f"  Interval   : {args.interval}")
     print(f"  Exit mode  : {cfg.exit_mode}")
     print(f"  Trend filt : {'ON (SMA200)' if cfg.use_trend_filter else 'OFF'}")
     print(f"  Risk/trade : {cfg.risk_per_trade_pct}%")
+    print(f"  Max hold   : {cfg.max_hold_days} bars (~20 calendar days)")
     print(f"  Equity     : ${cfg.initial_equity:,.0f}")
     print(f"  IS split   : {args.split:.0%} / {1-args.split:.0%}")
     if args.months:
@@ -227,10 +243,14 @@ def main() -> None:
 
     for symbol in symbols:
         asset_class = "crypto" if symbol in _CRYPTO else "equity"
-        df = bt_data.load_dataframe(symbol)
+        df = bt_data.load_dataframe(symbol, interval=args.interval)
         if df is None:
             print(f"\n[{symbol}] SKIP — no cached data (run with --fetch)")
             continue
+        if args.interval != "D1":
+            span_days = (df.index[-1] - df.index[0]).days
+            print(f"\n[{symbol}] {len(df)} {args.interval} bars — real coverage: "
+                  f"{df.index[0].date()} to {df.index[-1].date()} (~{span_days}d)")
 
         if args.months:
             import pandas as pd

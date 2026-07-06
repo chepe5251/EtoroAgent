@@ -53,8 +53,15 @@ logger = logging.getLogger(__name__)
 _CACHE_DIR = Path(__file__).parent.parent.parent / "data" / "candles"
 _TRADING_DAYS_PER_YEAR = 252
 _MIN_BARS_FOR_BACKTEST = 250
-_PAGE_LIMIT = 1000          # eToro API max per request
-_MAX_GAP_DAYS = 10          # log warning if gap between bars exceeds this
+_PAGE_LIMIT = 1000          # eToro API max per request — confirmed NOT paginable:
+                            # asc and desc requests both return the identical most
+                            # recent 1000-bar window, just reordered. This hard-caps
+                            # how much history is obtainable for intraday intervals.
+_MAX_GAP_DAYS = 10          # log warning if gap between bars exceeds this (D1 only)
+
+# Bars/calendar-day for each interval — eToro quotes stock CFDs continuously
+# (24h/day, confirmed via live H4/H1 fetch — NOT limited to exchange hours).
+_BARS_PER_DAY = {"D1": 1, "H4": 6, "H1": 24}
 
 # ── eToro response field mapping ─────────────────────────────────────────────
 # Candidates tried in order (first match wins).
@@ -72,8 +79,9 @@ _ETORO_FIELD_MAP = {
 }
 
 
-def _cache_path(symbol: str) -> Path:
-    return _CACHE_DIR / f"{symbol.upper()}.csv"
+def _cache_path(symbol: str, interval: str = "D1") -> Path:
+    suffix = "" if interval == "D1" else f"_{interval}"
+    return _CACHE_DIR / f"{symbol.upper()}{suffix}.csv"
 
 
 def _pick(d: dict, candidates: list[str]):
@@ -118,9 +126,9 @@ def _normalise_candle(c: dict) -> dict | None:
         return None
 
 
-def load_cached_candles(symbol: str) -> list[dict] | None:
+def load_cached_candles(symbol: str, interval: str = "D1") -> list[dict] | None:
     """Load candles from CSV cache. Returns None if no cache file exists."""
-    path = _cache_path(symbol)
+    path = _cache_path(symbol, interval)
     if not path.exists():
         return None
     try:
@@ -141,10 +149,10 @@ def load_cached_candles(symbol: str) -> list[dict] | None:
         return None
 
 
-def save_candles(symbol: str, candles: list[dict]) -> None:
+def save_candles(symbol: str, candles: list[dict], interval: str = "D1") -> None:
     """Save normalised candle list to CSV cache."""
     _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    path = _cache_path(symbol)
+    path = _cache_path(symbol, interval)
     try:
         with open(path, "w", newline="") as f:
             writer = csv.DictWriter(
@@ -161,19 +169,13 @@ async def _fetch_page(
     symbol: str,
     client: "EtoroClient",
     count: int,
+    interval: str = "D1",
     direction: str = "asc",
 ) -> list[dict]:
-    """
-    Fetch a single page of candles (up to _PAGE_LIMIT) from EtoroClient.
-
-    NOTE: Pagination beyond _PAGE_LIMIT bars is not yet implemented because the
-    eToro API does not document a date-range or cursor parameter (as of writing).
-    If the API gains such support, add `from_date` / `cursor` params here and
-    iterate pages in fetch_symbol().
-    """
+    """Fetch a single page of candles (up to _PAGE_LIMIT) from EtoroClient."""
     try:
         raw = await client.get_candles(
-            symbol, interval="D1", count=min(count, _PAGE_LIMIT), direction=direction
+            symbol, interval=interval, count=min(count, _PAGE_LIMIT), direction=direction
         )
         return raw or []
     except Exception as exc:
@@ -186,42 +188,31 @@ async def fetch_symbol(
     client: "EtoroClient",
     years: int = 5,
     force: bool = False,
+    interval: str = "D1",
 ) -> list[dict]:
     """
-    Download D1 candles for `symbol` via EtoroClient; cache to disk.
+    Download candles for `symbol` via EtoroClient; cache to disk (per-interval file).
 
     Returns the cached list if one exists (unless force=True).
     Returns [] on download failure (caller should skip the symbol).
 
-    Pagination note:
-      Requests up to `years × 252 + 60` bars, capped at _PAGE_LIMIT per page.
-      If the requested count > _PAGE_LIMIT and the API does not support date-range
-      pagination, only the most recent _PAGE_LIMIT bars are returned.  A warning
-      is logged when fewer bars than _MIN_BARS_FOR_BACKTEST are received.
+    CONFIRMED (live-tested): eToro caps every candles request at 1000 bars
+    and does NOT support pagination — asc and desc requests for the same
+    symbol/interval return the identical most recent 1000-bar window, just
+    reordered. For D1 that's ~4 years; for H4 ~8 months; for H1 ~6 weeks.
+    Requesting more `years` than that ceiling silently returns less data —
+    a warning is logged when fewer bars than _MIN_BARS_FOR_BACKTEST arrive.
     """
     if not force:
-        cached = load_cached_candles(symbol)
+        cached = load_cached_candles(symbol, interval)
         if cached:
-            logger.info("Using cached %d bars for %s", len(cached), symbol)
+            logger.info("Using cached %d %s bars for %s", len(cached), interval, symbol)
             return cached
 
-    target = years * _TRADING_DAYS_PER_YEAR + 60   # +60 warmup buffer
+    bars_per_day = _BARS_PER_DAY.get(interval, 1)
+    target = int(years * 365 * bars_per_day) + 60   # +60 warmup buffer
 
-    # ── Single-page fetch (pagination pending API confirmation) ────────────
-    raw = await _fetch_page(symbol, client, count=min(target, _PAGE_LIMIT))
-
-    # If we need more and received a full page, attempt a second page with
-    # direction=asc (oldest first) — some APIs honour direction differently.
-    # NOTE: this is speculative; remove or adapt after verifying API behaviour.
-    if len(raw) >= _PAGE_LIMIT and target > _PAGE_LIMIT:
-        logger.info(
-            "%s: received full page (%d bars), need %d — attempting page 2 "
-            "(NOTE: verify pagination works before trusting multi-page data)",
-            symbol, len(raw), target,
-        )
-        page2 = await _fetch_page(symbol, client, count=_PAGE_LIMIT, direction="desc")
-        if page2:
-            raw = raw + page2
+    raw = await _fetch_page(symbol, client, count=min(target, _PAGE_LIMIT), interval=interval)
 
     candles = [_normalise_candle(c) for c in raw]
     candles = [c for c in candles if c is not None]
@@ -230,17 +221,16 @@ async def fetch_symbol(
         logger.warning("%s: API returned 0 usable candles", symbol)
         return []
 
-    # Dedup + sort (in case multi-page returns overlapping bars)
     candles = _dedup_and_sort(candles)
 
     if len(candles) < _MIN_BARS_FOR_BACKTEST:
         logger.warning(
-            "%s: only %d bars received (need >=%d). "
-            "Check pagination NOTE in data.py or increase cache TTL.",
-            symbol, len(candles), _MIN_BARS_FOR_BACKTEST,
+            "%s (%s): only %d bars received (need >=%d) — eToro's 1000-bar-per-"
+            "request cap with no pagination limits how far back %s data goes.",
+            symbol, interval, len(candles), _MIN_BARS_FOR_BACKTEST, interval,
         )
 
-    save_candles(symbol, candles)
+    save_candles(symbol, candles, interval)
     return candles
 
 
@@ -263,11 +253,12 @@ async def fetch_all(
     years: int = 5,
     force: bool = False,
     inter_request_delay: float = 0.5,
+    interval: str = "D1",
 ) -> dict[str, list[dict]]:
     """Fetch candles for a list of symbols. Returns {symbol: candles}."""
     results: dict[str, list[dict]] = {}
     for symbol in symbols:
-        results[symbol] = await fetch_symbol(symbol, client, years, force)
+        results[symbol] = await fetch_symbol(symbol, client, years, force, interval)
         await asyncio.sleep(inter_request_delay)
     return results
 
@@ -295,7 +286,7 @@ def _detect_gaps(df: pd.DataFrame, symbol: str) -> None:
     )
 
 
-def load_dataframe(symbol: str) -> pd.DataFrame | None:
+def load_dataframe(symbol: str, interval: str = "D1") -> pd.DataFrame | None:
     """
     Load cached candles into a pandas DataFrame.
 
@@ -307,11 +298,11 @@ def load_dataframe(symbol: str) -> pd.DataFrame | None:
     Post-processing:
       - Deduplicates by date (keeps last).
       - Sorts chronologically.
-      - Detects and logs large calendar gaps (potential data issues).
+      - Detects and logs large calendar gaps (potential data issues, D1 only).
     """
-    candles = load_cached_candles(symbol)
+    candles = load_cached_candles(symbol, interval)
     if not candles:
-        logger.warning("%s: no cache — run fetch first", symbol)
+        logger.warning("%s: no %s cache — run fetch first", symbol, interval)
         return None
 
     df = pd.DataFrame(candles)
@@ -339,7 +330,8 @@ def load_dataframe(symbol: str) -> pd.DataFrame | None:
         )
         return None
 
-    _detect_gaps(df, symbol)
+    if interval == "D1":
+        _detect_gaps(df, symbol)
 
     logger.info("%s: loaded %d bars", symbol, n)
     return df

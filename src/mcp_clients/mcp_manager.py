@@ -42,7 +42,6 @@ class MCPManager:
     Usage:
         manager = MCPManager()
         await manager.start()
-        tools = await manager.list_openai_tools()
         result = await manager.call_tool("indicators_full_analysis", {"symbol": "BTC"})
         await manager.stop()
     """
@@ -121,27 +120,6 @@ class MCPManager:
     # ------------------------------------------------------------------ #
     # Tool access
     # ------------------------------------------------------------------ #
-
-    async def list_openai_tools(self) -> list[dict]:
-        """
-        Return all registered tools in OpenAI function-calling schema format.
-        This is what gets passed to the LLM in every ReAct iteration.
-        """
-        schemas = []
-        for tool_name, (_, tool) in self._tool_registry.items():
-            schema = {
-                "type": "function",
-                "function": {
-                    "name": tool.name,
-                    "description": (tool.description or "").strip(),
-                    "parameters": tool.inputSchema or {
-                        "type": "object",
-                        "properties": {},
-                    },
-                },
-            }
-            schemas.append(schema)
-        return schemas
 
     async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> Any:
         """
