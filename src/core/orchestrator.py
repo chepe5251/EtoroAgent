@@ -18,7 +18,10 @@ yesterday's close, so there's nothing to wait for), execute AT open so
 fills happen as close to the opening price as possible:
   US:     scan 09:15, execute 09:30 America/New_York
   EU:     scan 08:45, execute 09:00 Europe/Berlin
-  ASIA:   scan 08:45, execute 09:00 Asia/Tokyo
+  ASIA:   scan 09:15, execute 09:30 America/New_York — "ASIA" is a symbol-list
+          label (BABA, JD, TSM, TM, SONY...), every one of them a US-listed ADR
+          trading NYSE/NASDAQ hours, not an Asian exchange (confirmed via real
+          hourly volume — see market_calendar.py)
   CRYPTO: scan+execute together, every 6 hours UTC (no market open concept)
 
 Daily:
@@ -118,13 +121,18 @@ class Orchestrator:
         # Scan runs before the market opens (D1 candles only need yesterday's
         # close); execute runs at the open so fills happen as close to the
         # opening price as possible.
+        #
+        # "ASIA" is a symbol-list label, not a trading venue: every symbol in
+        # ASIA_STOCKS is a US-listed ADR (confirmed via real hourly volume —
+        # see market_calendar.py), so it runs on US market hours too, not
+        # Asia/Tokyo local time.
         region_schedules = {
             "US":   dict(scan=dict(hour=9, minute=15, timezone="America/New_York"),
                           execute=dict(hour=9, minute=30, timezone="America/New_York")),
             "EU":   dict(scan=dict(hour=8, minute=45, timezone="Europe/Berlin"),
                           execute=dict(hour=9, minute=0, timezone="Europe/Berlin")),
-            "ASIA": dict(scan=dict(hour=8, minute=45, timezone="Asia/Tokyo"),
-                          execute=dict(hour=9, minute=0, timezone="Asia/Tokyo")),
+            "ASIA": dict(scan=dict(hour=9, minute=15, timezone="America/New_York"),
+                          execute=dict(hour=9, minute=30, timezone="America/New_York")),
         }
         for region in _REGIONS:
             if region == "CRYPTO":

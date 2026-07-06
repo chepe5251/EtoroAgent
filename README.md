@@ -230,14 +230,19 @@ yesterday's close, so there's nothing to wait for) and execution happens
 The shortlist scanned pre-market is persisted in `state.json` (`pending_signals`)
 between the two jobs.
 
+Note: "ASIA" is a symbol-list label, not a trading venue — every symbol in it
+(BABA, JD, TSM, TM, SONY, MUFG, INFY...) is a US-listed ADR, confirmed to trade
+NYSE/NASDAQ hours via real hourly volume (peaks 13:00-20:00 UTC, near-zero
+around Tokyo's actual 00:00 UTC open). It runs on the US schedule/calendar.
+
 | Job | When |
 |---|---|
 | US scan | 09:15 America/New_York |
 | US execute | 09:30 America/New_York (market open) |
 | EU scan | 08:45 Europe/Berlin |
 | EU execute | 09:00 Europe/Berlin (market open) |
-| ASIA scan | 08:45 Asia/Tokyo |
-| ASIA execute | 09:00 Asia/Tokyo (market open) |
+| ASIA scan | 09:15 America/New_York |
+| ASIA execute | 09:30 America/New_York (market open) |
 | Position review | 07:00 UTC daily |
 | Trailing stop adjustment | Every 60 minutes |
 | Daily P&L summary (Telegram) | 23:00 UTC |

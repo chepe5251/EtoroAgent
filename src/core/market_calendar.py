@@ -47,11 +47,16 @@ _REGION_CONFIGS: dict[str, dict] = {
         "close_h": 17, "close_m": 30,
     },
     "ASIA": {
-        "calendar": "XTKS",
-        "fallback": ["TSE", "XHKG"],
-        "tz": "Asia/Tokyo",
-        "open_h": 9, "open_m": 0,
-        "close_h": 15, "close_m": 0,
+        # "ASIA" is a symbol-list label, not a trading venue: every symbol in
+        # ASIA_STOCKS (BABA, JD, BIDU, NIO, TSM, TM, SONY, HMC, MUFG, KB, SE,
+        # INFY, WIT, HDB...) is a US-listed ADR trading on NYSE/NASDAQ hours,
+        # confirmed via real hourly volume (peaks 13:00-20:00 UTC = US session,
+        # near-zero around 00:00 UTC = Tokyo open). Use the US calendar/hours.
+        "calendar": "NYSE",
+        "fallback": ["NASDAQ"],
+        "tz": "America/New_York",
+        "open_h": 9, "open_m": 30,
+        "close_h": 16, "close_m": 0,
     },
     "CRYPTO": {
         "calendar": None,
