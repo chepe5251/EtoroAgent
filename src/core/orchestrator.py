@@ -13,11 +13,13 @@ Architecture:
   REVIEW PLANE     → PositionReviewAgent (deterministic technical check, 1×/day)
   MAINTENANCE      → TrailingStopAgent (every 60 min, deterministic)
 
-Schedule per region (5 min after market open):
-  US:     CronTrigger(hour=9, min=35, tz="America/New_York")
-  EU:     CronTrigger(hour=9, min=5,  tz="Europe/Berlin")
-  ASIA:   CronTrigger(hour=9, min=5,  tz="Asia/Tokyo")
-  CRYPTO: every 6 hours UTC
+Schedule per region — scan BEFORE the market opens (D1 candles only need
+yesterday's close, so there's nothing to wait for), execute AT open so
+fills happen as close to the opening price as possible:
+  US:     scan 09:15, execute 09:30 America/New_York
+  EU:     scan 08:45, execute 09:00 Europe/Berlin
+  ASIA:   scan 08:45, execute 09:00 Asia/Tokyo
+  CRYPTO: scan+execute together, every 6 hours UTC (no market open concept)
 
 Daily:
   Position review:  07:00 UTC (before any equity market opens)
@@ -29,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -112,15 +115,22 @@ class Orchestrator:
     # ── Schedule setup ────────────────────────────────────────────────────────
 
     def _setup_schedules(self):
+        # Scan runs before the market opens (D1 candles only need yesterday's
+        # close); execute runs at the open so fills happen as close to the
+        # opening price as possible.
         region_schedules = {
-            "US":   dict(hour=9, minute=35, timezone="America/New_York"),
-            "EU":   dict(hour=9, minute=5,  timezone="Europe/Berlin"),
-            "ASIA": dict(hour=9, minute=5,  timezone="Asia/Tokyo"),
+            "US":   dict(scan=dict(hour=9, minute=15, timezone="America/New_York"),
+                          execute=dict(hour=9, minute=30, timezone="America/New_York")),
+            "EU":   dict(scan=dict(hour=8, minute=45, timezone="Europe/Berlin"),
+                          execute=dict(hour=9, minute=0, timezone="Europe/Berlin")),
+            "ASIA": dict(scan=dict(hour=8, minute=45, timezone="Asia/Tokyo"),
+                          execute=dict(hour=9, minute=0, timezone="Asia/Tokyo")),
         }
         for region in _REGIONS:
             if region == "CRYPTO":
+                # No market-open concept — scan and execute together, as before.
                 self._scheduler.add_job(
-                    self._screen_region,
+                    self._scan_and_execute_region,
                     IntervalTrigger(hours=6),
                     args=[region],
                     id=f"screen_{region}",
@@ -130,11 +140,20 @@ class Orchestrator:
                 )
             elif region in region_schedules:
                 self._scheduler.add_job(
-                    self._screen_region,
-                    CronTrigger(**region_schedules[region]),
+                    self._scan_region,
+                    CronTrigger(**region_schedules[region]["scan"]),
                     args=[region],
-                    id=f"screen_{region}",
-                    name=f"Screening {region}",
+                    id=f"scan_{region}",
+                    name=f"Scan {region}",
+                    max_instances=1,
+                    coalesce=True,
+                )
+                self._scheduler.add_job(
+                    self._execute_region,
+                    CronTrigger(**region_schedules[region]["execute"]),
+                    args=[region],
+                    id=f"execute_{region}",
+                    name=f"Execute {region}",
                     max_instances=1,
                     coalesce=True,
                 )
@@ -164,17 +183,15 @@ class Orchestrator:
 
     # ── Scheduled jobs ────────────────────────────────────────────────────────
 
-    async def _screen_region(self, region: str):
-        logger.info("=== Screening %s — %s ===", region, _utcnow().isoformat())
+    async def _scan_region(self, region: str):
+        """Pre-market scan: run the deterministic screener and stash the
+        shortlist in state. Execution happens separately, at market open,
+        in _execute_region."""
+        logger.info("=== Scan %s — %s ===", region, _utcnow().isoformat())
         self.state.reset_daily_if_needed()
 
-        if region != "CRYPTO" and not is_trading_day(region):
-            logger.info("Screening %s: not a trading day — skipping", region)
-            return
-
-        balance = await self._get_balance()
-        if balance <= 0:
-            logger.warning("Cannot fetch balance — skipping %s cycle", region)
+        if not is_trading_day(region):
+            logger.info("Scan %s: not a trading day — skipping", region)
             return
 
         symbols = get_symbols(region)
@@ -188,15 +205,31 @@ class Orchestrator:
             await self.notification_agent.send_critical_error(f"Screening failed for {region}: {exc}")
             shortlist = []
 
-        if not shortlist:
-            logger.info("Screening %s: empty shortlist", region)
+        self.state.pending_signals[region] = [asdict(r) for r in shortlist]
+        self.state.save()
+        logger.info("Scan %s: shortlist=%s", region, [r.symbol for r in shortlist])
+
+    async def _execute_region(self, region: str):
+        """Market-open execution: build a thesis from each pending signal
+        scanned earlier and run it through risk_gate → ExecutionAgent."""
+        logger.info("=== Execute %s — %s ===", region, _utcnow().isoformat())
+
+        pending = self.state.pending_signals.pop(region, [])
+        self.state.save()
+        if not pending:
+            logger.info("Execute %s: no pending signals", region)
             return
 
-        logger.info(
-            "Screening %s: shortlist=%s", region, [r.symbol for r in shortlist]
-        )
+        if not is_trading_day(region):
+            logger.info("Execute %s: not a trading day — discarding pending signals", region)
+            return
 
-        # Compute unrealized P&L once before the execution loop (P1-4)
+        balance = await self._get_balance()
+        if balance <= 0:
+            logger.warning("Cannot fetch balance — skipping %s execution", region)
+            return
+
+        shortlist = [ScreeningResult(**d) for d in pending]
         unrealized_pnl = self._unrealized_pnl()
 
         for result in shortlist:
@@ -209,7 +242,12 @@ class Orchestrator:
                 )
 
         self.state.last_updated = _utcnow()
-        logger.info("=== Screening %s complete ===", region)
+        logger.info("=== Execute %s complete ===", region)
+
+    async def _scan_and_execute_region(self, region: str):
+        """CRYPTO path: no market-open concept, so scan and execute in one shot."""
+        await self._scan_region(region)
+        await self._execute_region(region)
 
     async def _build_and_execute(
         self, result: ScreeningResult, balance: float, unrealized_pnl: float

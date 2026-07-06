@@ -224,11 +224,20 @@ docker-compose down
 
 ## Schedule
 
+Scanning happens *before* each market opens (D1 candles only need
+yesterday's close, so there's nothing to wait for) and execution happens
+*at* the open, so fills land as close to the opening price as possible.
+The shortlist scanned pre-market is persisted in `state.json` (`pending_signals`)
+between the two jobs.
+
 | Job | When |
 |---|---|
-| US screening | 09:35 America/New_York (market open +5 min) |
-| EU screening | 09:05 Europe/Berlin |
-| ASIA screening | 09:05 Asia/Tokyo |
+| US scan | 09:15 America/New_York |
+| US execute | 09:30 America/New_York (market open) |
+| EU scan | 08:45 Europe/Berlin |
+| EU execute | 09:00 Europe/Berlin (market open) |
+| ASIA scan | 08:45 Asia/Tokyo |
+| ASIA execute | 09:00 Asia/Tokyo (market open) |
 | Position review | 07:00 UTC daily |
 | Trailing stop adjustment | Every 60 minutes |
 | Daily P&L summary (Telegram) | 23:00 UTC |

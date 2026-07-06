@@ -97,6 +97,9 @@ class ProjectState:
         self.risk_block_reason: str = ""
         self.last_updated: datetime = _utcnow()
         self._daily_reset_date: str = _utcnow().date().isoformat()
+        # Screening results scanned pre-market, executed once the region's
+        # market actually opens — see Orchestrator._scan_region/_execute_region.
+        self.pending_signals: dict[str, list[dict]] = {}
 
     def reset_daily_if_needed(self) -> bool:
         today = _utcnow().date().isoformat()
@@ -134,6 +137,7 @@ class ProjectState:
             "is_risk_blocked": self.is_risk_blocked,
             "risk_block_reason": self.risk_block_reason,
             "_daily_reset_date": self._daily_reset_date,
+            "pending_signals": self.pending_signals,
             "saved_at": _utcnow().isoformat(),
         }
         try:
@@ -159,6 +163,7 @@ class ProjectState:
             state._daily_reset_date = str(
                 data.get("_daily_reset_date", _utcnow().date().isoformat())
             )
+            state.pending_signals = dict(data.get("pending_signals", {}))
             logger.info(
                 "State loaded from %s: %d open positions, daily_pnl=%.2f",
                 target, len(state.open_positions), state.daily_pnl,
