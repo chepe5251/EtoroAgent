@@ -10,7 +10,7 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-_STATE_FILE = Path("state.json")
+_STATE_FILE = Path(__file__).parent.parent.parent / "state.json"
 
 
 def get_hard_exit_days() -> int:
@@ -35,6 +35,8 @@ class Position:
     atr: float = 0.0
     horizon_days: int = 10
     invalidation_condition: str = ""
+    leverage: float = 1.0   # real CFD leverage used on this position (amount_usd is
+                            # notional exposure; broker margin = amount_usd/leverage)
 
     @property
     def days_open(self) -> int:
@@ -62,6 +64,7 @@ class Position:
             "atr": self.atr,
             "horizon_days": self.horizon_days,
             "invalidation_condition": self.invalidation_condition,
+            "leverage": self.leverage,
         }
 
     @classmethod
@@ -82,6 +85,7 @@ class Position:
             atr=float(d.get("atr", 0.0)),
             horizon_days=int(d.get("horizon_days", 10)),
             invalidation_condition=str(d.get("invalidation_condition", "")),
+            leverage=float(d.get("leverage", 1.0)),
         )
 
 

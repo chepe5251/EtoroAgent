@@ -64,15 +64,36 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="IS/OOS split ratio (default 0.7)")
     p.add_argument("--walk-forward", action="store_true",
                    help="Run walk-forward mode (4 folds)")
-    p.add_argument("--exit", choices=["mean_reversion", "trailing"],
+    p.add_argument("--exit", choices=["mean_reversion", "trailing", "trend_break"],
                    default="mean_reversion",
                    help="Exit mode (default: mean_reversion)")
     p.add_argument("--no-trend-filter", action="store_true",
-                   help="Disable SMA200 trend filter (compare variant)")
+                   help="Disable trend filter (compare variant)")
+    p.add_argument("--trend-filter-type", choices=["sma200", "ema50_200"],
+                   default="sma200",
+                   help="Trend filter: close>SMA200, or EMA50>EMA200 (default sma200)")
+    p.add_argument("--breakout", action="store_true",
+                   help="Enable Donchian breakout entry signal (trend-following)")
+    p.add_argument("--donchian-lookback", type=int, default=20,
+                   help="Breakout lookback in bars (default 20)")
+    p.add_argument("--pullback", action="store_true",
+                   help="Enable EMA20 pullback-resume entry signal (trend-following)")
+    p.add_argument("--profit-target-pct", type=float, default=0.0,
+                   help="Fixed take-profit %% (0 = disabled, use exit mode's own logic)")
+    p.add_argument("--structure-filter", action="store_true",
+                   help="Require bullish market structure (HH/HL) to allow any entry")
+    p.add_argument("--structure-swing-k", type=int, default=2,
+                   help="Swing pivot confirmation window for the structure filter (default 2)")
+    p.add_argument("--no-rsi-signal", action="store_true",
+                   help="Disable RSI reversal entries (compare variant)")
+    p.add_argument("--no-ema-signal", action="store_true",
+                   help="Disable EMA crossover entries (compare variant)")
     p.add_argument("--risk-pct", type=float, default=1.0,
                    help="Risk %% per trade of equity (default 1.0)")
     p.add_argument("--equity", type=float, default=10_000.0,
                    help="Starting equity in USD (default 10000)")
+    p.add_argument("--leverage", type=float, default=1.0,
+                   help="Leverage multiplier on the notional cap (default 1.0 = no leverage)")
     p.add_argument("--verbose", action="store_true")
     return p
 
@@ -148,12 +169,17 @@ def _print_aggregate(
     pf_list = [m.profit_factor for m in all_metrics if m.n_trades > 0 and not (m.profit_factor == float("inf"))]
     pf_avg = sum(pf_list) / len(pf_list) if pf_list else 0.0
 
+    dd_list = [m.max_drawdown_pct for m in all_metrics if m.n_trades > 0]
+    dd_avg = sum(dd_list) / len(dd_list) if dd_list else 0.0
+    dd_max = max(dd_list) if dd_list else 0.0
+
     print(f"\n{'═' * 56}")
     print(f"  AGGREGATE — {label} ({len(all_metrics)} symbols, {n_trades} trades)")
     print(f"  Win rate:   {win_rate_agg * 100:.1f}%")
     print(f"  Avg P&L:    {avg_pnl:+.2f}% / trade")
     print(f"  Total P&L:  ${total_pnl:+,.2f}")
     print(f"  Avg PF:     {pf_avg:.2f}")
+    print(f"  Avg MaxDD:  {dd_avg:.2f}%  (worst symbol: {dd_max:.2f}%)")
     print(f"  Exits:      {exit_totals}")
     print(f"{'═' * 56}")
 
@@ -171,7 +197,17 @@ def main() -> None:
         initial_equity=args.equity,
         risk_per_trade_pct=args.risk_pct,
         use_trend_filter=not args.no_trend_filter,
+        trend_filter_type=args.trend_filter_type,
+        use_rsi_signal=not args.no_rsi_signal,
+        use_ema_signal=not args.no_ema_signal,
+        use_breakout_signal=args.breakout,
+        donchian_lookback=args.donchian_lookback,
+        use_pullback_signal=args.pullback,
+        profit_target_pct=args.profit_target_pct,
+        use_structure_filter=args.structure_filter,
+        structure_swing_k=args.structure_swing_k,
         exit_mode=args.exit,
+        leverage=args.leverage,
     )
 
     print(f"\n{'#' * 56}")
@@ -200,6 +236,15 @@ def main() -> None:
             import pandas as pd
             cutoff = df.index[-1] - pd.DateOffset(months=args.months)
             df = df[df.index >= cutoff]
+            
+            # Check if the filtered dataframe has enough bars for the warmup period
+            # The warmup is calculated as cfg.sma_trend + 10 (default 200 + 10 = 210)
+            warmup_bars = 210  # Default value based on cfg.sma_trend + 10
+            if len(df) < warmup_bars:
+                print(f"\n[{symbol}] WARNING — --months={args.months} results in only {len(df)} "
+                      f"bars, which is less than the required warmup period of {warmup_bars} bars. "
+                      f"This may lead to unreliable backtest results.")
+            
             if len(df) < 20: # arbitrary minimum
                 print(f"\n[{symbol}] SKIP — too few bars after --months filter")
                 continue

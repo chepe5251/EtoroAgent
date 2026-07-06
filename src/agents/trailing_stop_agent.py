@@ -49,7 +49,7 @@ class TrailingStopAgent:
             return
 
         current = float(
-            rate_info.get("close", rate_info.get("bid", rate_info.get("rate", 0)))
+            rate_info.get("close") or rate_info.get("bid") or rate_info.get("rate") or 0
         )
         if not current:
             return

@@ -1,13 +1,12 @@
 """
-Tests for PositionReviewAgent.
-Focus: 20-day hard exit limit (deterministic), LLM verdict routing.
+Tests for PositionReviewAgent (100% deterministic, no LLM).
+Focus: 20-day hard exit limit, trend_break (close < EMA50) exit logic.
 """
 import sys
 import importlib
 import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -29,7 +28,7 @@ def _make_position(
     is_buy: bool = True,
     days_open: int = 5,
     horizon_days: int = 10,
-    invalidation_condition: str = "If EMA20 crosses below EMA50",
+    invalidation_condition: str = "Daily close falls below EMA50 (trend break)",
     entry_rate: float = 50000.0,
     atr: float = 1200.0,
 ) -> Position:
@@ -55,14 +54,24 @@ def _make_state(*positions: Position) -> ProjectState:
     return state
 
 
-def _make_agent(state: ProjectState) -> PositionReviewAgent:
-    mock_mcp = MagicMock()
+def _rising_closes(n: int = 60, start: float = 100.0, end: float = 150.0) -> list[float]:
+    step = (end - start) / (n - 1)
+    return [start + step * i for i in range(n)]
+
+
+def _candles_from_closes(closes: list[float]) -> list[dict]:
+    return [{"open": c, "high": c, "low": c, "close": c, "volume": 1_000_000} for c in closes]
+
+
+def _make_agent(state: ProjectState, candles: list[dict] | None = None) -> PositionReviewAgent:
+    mock_client = MagicMock()
+    mock_client.get_candles = AsyncMock(return_value=candles if candles is not None else [])
     mock_exec = MagicMock()
-    mock_exec.close_position = AsyncMock()
+    mock_exec.client = mock_client
+    mock_exec.close_position = AsyncMock(return_value=True)
     mock_notif = MagicMock()
-    mock_notif.send_thesis_rejected = AsyncMock()
+    mock_notif.send_critical_error = AsyncMock()
     return PositionReviewAgent(
-        mcp_manager=mock_mcp,
         execution_agent=mock_exec,
         notification_agent=mock_notif,
         state=state,
@@ -91,17 +100,16 @@ def test_days_open_computed_correctly():
     assert 6 <= pos.days_open <= 8  # allow 1-day rounding
 
 
-# ── Hard exit is enforced (no LLM call) ──────────────────────────────────────
+# ── Hard exit is enforced (no technical check needed) ────────────────────────
 
 @pytest.mark.asyncio
 async def test_hard_exit_at_20_days_closes_position():
-    """A 20-day-old position must be closed even if LLM says hold."""
+    """A 20-day-old position must be closed without even checking price data."""
     pos = _make_position(days_open=20)
     state = _make_state(pos)
     agent = _make_agent(state)
 
-    # LLM should NOT be called at all for a hard exit
-    with patch.object(agent, "_llm_review", new=AsyncMock()) as mock_review:
+    with patch.object(agent, "_technical_review", new=AsyncMock()) as mock_review:
         await agent._review_position(pos)
 
     mock_review.assert_not_called()
@@ -115,7 +123,7 @@ async def test_hard_exit_close_reason_mentions_20_days():
     state = _make_state(pos)
     agent = _make_agent(state)
 
-    with patch.object(agent, "_llm_review", new=AsyncMock()):
+    with patch.object(agent, "_technical_review", new=AsyncMock()):
         await agent._review_position(pos)
 
     call_args = agent.execution_agent.close_position.call_args
@@ -123,61 +131,57 @@ async def test_hard_exit_close_reason_mentions_20_days():
     assert "20" in reason or "hard" in reason.lower()
 
 
-# ── LLM verdict routing ───────────────────────────────────────────────────────
+# ── Deterministic trend-break review ──────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_llm_exit_verdict_closes_position():
+async def test_close_below_ema50_triggers_exit():
+    """A falling price series (close < EMA50) must trigger an exit."""
     pos = _make_position(days_open=5)
     state = _make_state(pos)
-    agent = _make_agent(state)
+    falling = list(reversed(_rising_closes(n=60, start=100.0, end=150.0)))
+    agent = _make_agent(state, candles=_candles_from_closes(falling))
 
-    verdict = {"action": "exit", "reason": "Invalidation condition met: EMA cross", "new_stop_atr_multiple": None}
-    with patch.object(agent, "_llm_review", new=AsyncMock(return_value=verdict)):
-        await agent._review_position(pos)
+    await agent._review_position(pos)
 
     agent.execution_agent.close_position.assert_called_once()
 
 
 @pytest.mark.asyncio
-async def test_llm_hold_verdict_does_not_close():
+async def test_close_above_ema50_holds():
+    """A steadily rising price series (close >= EMA50) must NOT trigger an exit."""
     pos = _make_position(days_open=5)
     state = _make_state(pos)
-    agent = _make_agent(state)
+    rising = _rising_closes(n=60, start=100.0, end=150.0)
+    agent = _make_agent(state, candles=_candles_from_closes(rising))
 
-    verdict = {"action": "hold", "reason": "RSI still oversold", "new_stop_atr_multiple": None}
-    with patch.object(agent, "_llm_review", new=AsyncMock(return_value=verdict)):
-        await agent._review_position(pos)
+    await agent._review_position(pos)
 
     agent.execution_agent.close_position.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_llm_tighten_stop_adjusts_stop():
-    pos = _make_position(days_open=8, atr=1000.0, entry_rate=50000.0)
-    original_stop = pos.stop_loss_pct
+async def test_insufficient_candle_history_skips_action():
+    """Fewer than EMA_PERIOD candles -> no verdict -> no action."""
+    pos = _make_position(days_open=5)
     state = _make_state(pos)
-    agent = _make_agent(state)
+    agent = _make_agent(state, candles=_candles_from_closes(_rising_closes(n=10)))
 
-    verdict = {"action": "tighten_stop", "reason": "trade +10%, tighten", "new_stop_atr_multiple": 1.0}
-    with patch.object(agent, "_llm_review", new=AsyncMock(return_value=verdict)):
-        await agent._review_position(pos)
+    await agent._review_position(pos)
 
-    # Stop should be tighter (lower %)
-    new_stop_pct = (1000.0 * 1.0 / 50000.0) * 100  # = 2.0%
-    assert pos.stop_loss_pct <= original_stop  # not looser
+    agent.execution_agent.close_position.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_tighten_stop_persists_state(monkeypatch):
-    pos = _make_position(days_open=8, atr=1000.0, entry_rate=50000.0)
+async def test_candle_fetch_failure_skips_action():
+    """If the candle fetch raises, no verdict -> no action, no crash."""
+    pos = _make_position(days_open=5)
     state = _make_state(pos)
     agent = _make_agent(state)
-    save = MagicMock()
-    monkeypatch.setattr(state, "save", save)
+    agent.execution_agent.client.get_candles = AsyncMock(side_effect=Exception("network error"))
 
-    await agent._tighten(pos, 0.5, "tighten")
+    await agent._review_position(pos)
 
-    save.assert_called_once()
+    agent.execution_agent.close_position.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -193,26 +197,12 @@ async def test_close_does_not_log_success_when_execution_fails(caplog):
     assert "closed BTC" not in caplog.text
 
 
-@pytest.mark.asyncio
-async def test_no_llm_verdict_skips_action():
-    """If LLM returns None (parse error), no action taken."""
-    pos = _make_position(days_open=5)
-    state = _make_state(pos)
-    agent = _make_agent(state)
-
-    with patch.object(agent, "_llm_review", new=AsyncMock(return_value=None)):
-        await agent._review_position(pos)
-
-    agent.execution_agent.close_position.assert_not_called()
-
-
 # ── review_all ────────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_review_all_with_no_positions_does_nothing():
     state = _make_state()
     agent = _make_agent(state)
-    # Should complete without error
     await agent.review_all()
     agent.execution_agent.close_position.assert_not_called()
 
@@ -226,11 +216,11 @@ async def test_review_all_reviews_each_position():
 
     reviewed = []
 
-    async def track_review(pos, **kwargs):
+    async def track_review(pos):
         reviewed.append(pos.symbol)
         return None
 
-    with patch.object(agent, "_llm_review", new=AsyncMock(side_effect=track_review)):
+    with patch.object(agent, "_technical_review", new=AsyncMock(side_effect=track_review)):
         await agent.review_all()
 
     assert set(reviewed) == {"BTC", "ETH"}

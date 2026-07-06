@@ -36,12 +36,12 @@ def _normalise(candles: list[dict]) -> list[dict]:
     out = []
     for c in candles:
         out.append({
-            "open":   float(c.get("open",   c.get("Open",   0))),
-            "high":   float(c.get("high",   c.get("High",   0))),
-            "low":    float(c.get("low",    c.get("Low",    0))),
-            "close":  float(c.get("close",  c.get("Close",  0))),
-            "volume": float(c.get("volume", c.get("Volume", 0))),
-            "time":   c.get("time", c.get("Time", c.get("timestamp", ""))),
+            "open":   float(c.get("open") or c.get("Open") or 0),
+            "high":   float(c.get("high") or c.get("High") or 0),
+            "low":    float(c.get("low") or c.get("Low") or 0),
+            "close":  float(c.get("close") or c.get("Close") or 0),
+            "volume": float(c.get("volume") or c.get("Volume") or 0),
+            "time":   c.get("time") or c.get("Time") or c.get("timestamp") or "",
         })
     return out
 

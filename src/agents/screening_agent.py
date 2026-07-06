@@ -1,28 +1,29 @@
 """
-ScreeningAgent — two-stage funnel over the full symbol universe.
+ScreeningAgent — 100% deterministic filter over the full symbol universe.
+No LLM anywhere in this path (see src/agents/thesis_builder.py for how the
+resulting candidates become an order).
 
-Stage 1a (deterministic): pure-Python indicators on daily candles.
-  Filter criteria (any ONE passes):
-    - RSI(14) < 35 (oversold) or > 65 (overbought)
-    - EMA20/EMA50 crossover in the last 3 days
-    - Relative volume > 1.5× 20-day average
+Pure-Python indicators on daily candles. Trend-following filter, validated
+against 5 years of real eToro data with full fees + leverage in
+src/backtest (see src/backtest/engine.py's use_breakout_signal /
+use_pullback_signal / trend_filter_type="ema50_200"):
+  - Trend gate: EMA50 > EMA200 (must hold for ANY signal below to count)
+  - Entry A: Donchian breakout — close > highest high of prior 20 bars
+  - Entry B: EMA20 pullback-resume — close crosses back above EMA20
+  - Both require relative volume > 1.5x the 20-day average (equities only;
+    eToro reports no crypto volume, so crypto is excluded from this gate
+    entirely upstream via WATCH_REGIONS)
 
-Stage 1b (fast LLM): single LLM call per batch of 8 symbols, no tools.
-  Asks the model to pick the top 3 most promising for deep research.
-  Falls back to passing all candidates if the LLM call fails.
-
-Output: shortlist of up to 15 symbols sent to ResearchAgent for deep ReAct.
+Output: up to _MAX_SHORTLIST candidates, in universe order, sent straight to
+build_thesis() and the deterministic risk gate.
 """
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 from dataclasses import dataclass, field
 from typing import Optional, TYPE_CHECKING
-
-from openai import AsyncOpenAI
 
 from src.tools.technical import rsi as _rsi, ema as _ema, atr as _atr, relative_volume as _rvol
 
@@ -31,9 +32,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_BATCH_SIZE = 8            # symbols per LLM batch
 _MAX_SHORTLIST = 15        # hard cap on output symbols
-_CANDLE_COUNT = 60         # how many daily candles to fetch per symbol
+_CANDLE_COUNT = 250        # need >=200 bars for a stable EMA200 trend gate
 _FETCH_BATCH = 10          # parallel HTTP requests per tick
 _FETCH_DELAY = 1.5         # seconds between fetch batches
 
@@ -44,49 +44,37 @@ class ScreeningResult:
     rsi: Optional[float] = None
     ema20: Optional[float] = None
     ema50: Optional[float] = None
+    ema200: Optional[float] = None
     atr: Optional[float] = None
     rel_volume: Optional[float] = None
-    ema_cross: bool = False
+    trend_up: bool = False
+    breakout: bool = False
+    pullback_resume: bool = False
     score_tags: list[str] = field(default_factory=list)
 
 
 class ScreeningAgent:
     def __init__(self, client: "EtoroClient"):
         self.client = client
-        self._llm = AsyncOpenAI(
-            base_url=os.getenv("LLM_BASE_URL", "http://localhost:1234/v1"),
-            api_key=os.getenv("LLM_API_KEY", "lm-studio"),
-        )
-        self._screening_model = os.getenv(
-            "SCREENING_LLM_MODEL",
-            os.getenv("LLM_MODEL", "deepseek-coder-v2-lite-instruct"),
-        )
-        self._rsi_lo = float(os.getenv("SCREEN_RSI_OVERSOLD", "35"))
-        self._rsi_hi = float(os.getenv("SCREEN_RSI_OVERBOUGHT", "65"))
         self._rel_vol = float(os.getenv("SCREEN_REL_VOL", "1.5"))
-        self._ema_cross_days = int(os.getenv("SCREEN_EMA_CROSS_DAYS", "3"))
+        self._donchian_lookback = int(os.getenv("SCREEN_DONCHIAN_LOOKBACK", "20"))
 
     # ── Public ────────────────────────────────────────────────────────────────
 
-    async def run(self, symbols: list[str]) -> list[str]:
+    async def run(self, symbols: list[str]) -> list[ScreeningResult]:
         """
-        Run the two-stage funnel.
-        Returns up to _MAX_SHORTLIST symbols for deep research.
+        Run the deterministic filter over the whole universe.
+        Returns up to _MAX_SHORTLIST candidates, in universe order.
         """
         logger.info("Screening: %d symbols → funnel start", len(symbols))
 
         candidates = await self._stage1a(symbols)
         logger.info(
-            "Screening 1a: %d/%d passed deterministic filter",
+            "Screening: %d/%d passed deterministic filter",
             len(candidates), len(symbols),
         )
-
-        if not candidates:
-            return []
-
-        shortlist = await self._stage1b(candidates)
-        result = [r.symbol for r in shortlist[:_MAX_SHORTLIST]]
-        logger.info("Screening 1b: shortlist=%s", result)
+        result = candidates[:_MAX_SHORTLIST]
+        logger.info("Screening: shortlist=%s", [r.symbol for r in result])
         return result
 
     # ── Stage 1a — deterministic ──────────────────────────────────────────────
@@ -118,120 +106,75 @@ class ScreeningAgent:
         return out
 
     def _compute(self, symbol: str, candles: list[dict]) -> Optional[ScreeningResult]:
-        if len(candles) < 30:
+        if len(candles) < self._donchian_lookback + 2:
             return None
 
         try:
-            closes  = [float(c.get("close",  c.get("c", 0))) for c in candles]
-            highs   = [float(c.get("high",   c.get("h", 0))) for c in candles]
-            lows    = [float(c.get("low",    c.get("l", 0))) for c in candles]
-            volumes = [float(c.get("volume", c.get("v", 0))) for c in candles]
+            closes  = [float(c.get("close")  or c.get("c") or 0) for c in candles]
+            highs   = [float(c.get("high")   or c.get("h") or 0) for c in candles]
+            lows    = [float(c.get("low")    or c.get("l") or 0) for c in candles]
+            volumes = [float(c.get("volume") or c.get("v") or 0) for c in candles]
 
-            last_rsi   = _rsi(closes, 14)
-            last_atr   = _atr(highs, lows, closes, 14)
-            last_rvol  = _rvol(volumes, 20)
+            last_rsi  = _rsi(closes, 14)
+            last_atr  = _atr(highs, lows, closes, 14)
+            last_rvol = _rvol(volumes, 20)
 
-            ema20_series = _ema(closes, 20)
-            ema50_series = _ema(closes, 50)
+            ema20_series  = _ema(closes, 20)
+            ema50_series  = _ema(closes, 50)
+            ema200_series = _ema(closes, 200)
 
-            last_ema20 = ema20_series[-1] if ema20_series else None
-            last_ema50 = ema50_series[-1] if ema50_series else None
+            last_ema20  = ema20_series[-1]  if ema20_series  else None
+            last_ema50  = ema50_series[-1]  if ema50_series  else None
+            last_ema200 = ema200_series[-1] if ema200_series else None
 
-            # EMA cross detection over last N candles.
-            # Both series end at the same (latest) date; align by taking the tail.
-            ema_cross = False
-            if ema20_series and ema50_series:
-                n = self._ema_cross_days
-                tail20 = ema20_series[-(n + 1):]
-                tail50 = ema50_series[-(n + 1):]
-                for i in range(1, min(len(tail20), len(tail50))):
-                    prev_e20, curr_e20 = tail20[i - 1], tail20[i]
-                    prev_e50, curr_e50 = tail50[i - 1], tail50[i]
-                    if (prev_e20 < prev_e50 and curr_e20 >= curr_e50) or \
-                       (prev_e20 > prev_e50 and curr_e20 <= curr_e50):
-                        ema_cross = True
-                        break
+            # Trend gate: EMA50 > EMA200 (need real history for this to mean
+            # anything — with < 200 candles this is left False, no signal).
+            trend_up = (
+                last_ema50 is not None and last_ema200 is not None
+                and last_ema50 > last_ema200
+            )
+
+            # Volume confirmation — required for either entry below. eToro
+            # reports no crypto volume (rel_vol always None there); crypto is
+            # excluded from this universe upstream via WATCH_REGIONS.
+            vol_ok = last_rvol is not None and last_rvol > self._rel_vol
+
+            # Entry A: Donchian breakout — close clears the prior N-bar high
+            # (excludes the current bar, no look-ahead).
+            n = self._donchian_lookback
+            donchian_high = max(highs[-(n + 1):-1]) if len(highs) > n else None
+            breakout = (
+                trend_up and vol_ok and donchian_high is not None
+                and closes[-1] > donchian_high
+            )
+
+            # Entry B: EMA20 pullback-resume — close was at/below EMA20 the
+            # prior bar and has now crossed back above it.
+            pullback_resume = False
+            if trend_up and vol_ok and len(ema20_series) >= 2 and len(closes) >= 2:
+                prev_close, curr_close = closes[-2], closes[-1]
+                prev_ema20, curr_ema20 = ema20_series[-2], ema20_series[-1]
+                pullback_resume = prev_close <= prev_ema20 and curr_close > curr_ema20
 
             tags: list[str] = []
-            if last_rsi is not None:
-                if last_rsi < self._rsi_lo:
-                    tags.append("rsi_oversold")
-                elif last_rsi > self._rsi_hi:
-                    tags.append("rsi_overbought")
-            if ema_cross:
-                tags.append("ema_cross")
-            if last_rvol is not None and last_rvol > self._rel_vol:
-                tags.append("high_volume")
+            if breakout:
+                tags.append("breakout")
+            if pullback_resume:
+                tags.append("pullback_resume")
 
             return ScreeningResult(
                 symbol=symbol,
                 rsi=last_rsi,
                 ema20=last_ema20,
                 ema50=last_ema50,
+                ema200=last_ema200,
                 atr=last_atr,
                 rel_volume=last_rvol,
-                ema_cross=ema_cross,
+                trend_up=trend_up,
+                breakout=breakout,
+                pullback_resume=pullback_resume,
                 score_tags=tags,
             )
         except Exception as exc:
             logger.warning("Indicator compute failed for %s: %s", symbol, exc)
             return None
-
-    # ── Stage 1b — LLM quick rank ─────────────────────────────────────────────
-
-    async def _stage1b(self, candidates: list[ScreeningResult]) -> list[ScreeningResult]:
-        if not candidates:
-            return []
-        shortlist: list[ScreeningResult] = []
-        for i in range(0, len(candidates), _BATCH_SIZE):
-            batch = candidates[i : i + _BATCH_SIZE]
-            ranked = await self._rank_batch(batch)
-            shortlist.extend(ranked)
-        return shortlist
-
-    async def _rank_batch(self, batch: list[ScreeningResult]) -> list[ScreeningResult]:
-        """Single LLM call to pick top 3 from a batch — no tool calling."""
-
-        def fmt(r: ScreeningResult) -> str:
-            rsi_s  = f"{r.rsi:.1f}"    if r.rsi        is not None else "N/A"
-            rvol_s = f"{r.rel_volume:.2f}" if r.rel_volume is not None else "N/A"
-            ema_rel = "above" if (r.ema20 and r.ema50 and r.ema20 > r.ema50) else "below"
-            return (
-                f"{r.symbol}: RSI={rsi_s}, EMA20={ema_rel} EMA50, "
-                f"RelVol={rvol_s}x, Flags={r.score_tags}"
-            )
-
-        lines = "\n".join(fmt(r) for r in batch)
-        prompt = (
-            f"You are a swing-trading screener (5-20 day horizon). "
-            f"Select the TOP 3 symbols below most likely to move significantly in the next 5-20 days. "
-            f"Prefer: clear RSI extremes with volume, fresh EMA crossovers. "
-            f"Avoid: ambiguous signals or low relative volume.\n\n"
-            f"Candidates:\n{lines}\n\n"
-            f"Return ONLY valid JSON array (no markdown, no explanation):\n"
-            f'[{{"symbol": "TICKER", "rank": 1, "reason": "brief"}}]'
-        )
-        try:
-            resp = await self._llm.chat.completions.create(
-                model=self._screening_model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.1,
-                max_tokens=256,
-            )
-            raw = resp.choices[0].message.content.strip()
-            # Strip markdown fences if present
-            if "```" in raw:
-                parts = raw.split("```")
-                for p in parts:
-                    p = p.strip().lstrip("json").strip()
-                    if p.startswith("["):
-                        raw = p
-                        break
-            picks = json.loads(raw)
-            selected = {item["symbol"] for item in picks}
-            result = [r for r in batch if r.symbol in selected]
-            logger.debug("LLM screening: %s → %s", [r.symbol for r in batch], list(selected))
-            return result
-        except Exception as exc:
-            logger.warning("LLM screening batch failed (%s) — passing all %d candidates", exc, len(batch))
-            return batch

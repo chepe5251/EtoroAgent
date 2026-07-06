@@ -304,7 +304,7 @@ class EtoroClient:
                 "instrumentId": str(p.get("instrumentID")),
                 "isBuy": p.get("isBuy"),
                 "openRate": p.get("openRate"),
-                "currentRate": p.get("currentRate", p.get("rate")),
+                "currentRate": p.get("currentRate") or p.get("rate"),
                 "stopLossRate": p.get("stopLossRate"),
                 "takeProfitRate": p.get("takeProfitRate"),
                 "amount": p.get("amount"),
@@ -325,6 +325,7 @@ class EtoroClient:
         stop_loss_pct: float,
         current_price: float,
         trailing_stop: bool = True,
+        leverage: int = 1,
     ) -> dict:
         """Open a new position via the unified order endpoint (POST
         /api/v2/trading/execution/orders, or .../demo/orders in demo mode).
@@ -335,6 +336,10 @@ class EtoroClient:
 
         stop_loss_pct is a % distance from current_price — converted here to the
         absolute stopLossRate the API requires (there is no percentage field).
+
+        amount_usd is the MARGIN committed from balance (not notional exposure) —
+        real market exposure = amount_usd × leverage. Callers sizing by notional
+        must pass amount_usd = notional / leverage.
         """
         if is_buy:
             stop_loss_rate = current_price * (1 - stop_loss_pct / 100)
@@ -346,7 +351,7 @@ class EtoroClient:
             "transaction": "buy" if is_buy else "sellShort",
             "instrumentId": int(instrument_id),
             "orderType": "mkt",
-            "leverage": 1,
+            "leverage": leverage,
             "amount": amount_usd,
             "orderCurrency": "usd",
             "stopLossRate": round(stop_loss_rate, 6),
@@ -376,22 +381,29 @@ class EtoroClient:
         self, order_id: int, attempts: int = 10, delay: float = 1.0
     ) -> dict:
         """Poll orders:lookup until the order reaches a terminal status.
-        status.id: 1 = Executed, 2 = Cancelled, 3 = Rejected (per API docs)."""
+
+        NOTE: the documented status.id mapping (1=Executed, 2=Cancelled,
+        3=Rejected) does NOT match production — a live order confirmed
+        status.id=3 with status.name="Filled" (a successful fill). Key off
+        the human-readable status.name instead, which is unambiguous.
+        """
         lookup_path = (
             "/api/v2/trading/info/demo/orders:lookup"
             if self.is_demo
             else "/api/v2/trading/info/orders:lookup"
         )
+        _SUCCESS_NAMES = {"filled", "executed"}
+        _FAILURE_NAMES = {"cancelled", "canceled", "rejected", "failed"}
         last_info: dict = {}
         for _ in range(attempts):
             last_info = await self._request(
                 "GET", lookup_path, params={"orderId": order_id}
             )
             status = last_info.get("status", {}) if isinstance(last_info, dict) else {}
-            status_id = status.get("id")
-            if status_id == 1:
+            status_name = str(status.get("name", "")).lower()
+            if status_name in _SUCCESS_NAMES:
                 return last_info
-            if status_id in (2, 3):
+            if status_name in _FAILURE_NAMES:
                 raise OrderRejected(
                     f"order {order_id} {status.get('name')}: {status.get('errorMessage')}"
                 )

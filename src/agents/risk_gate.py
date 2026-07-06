@@ -2,7 +2,7 @@
 RiskGate — 100% deterministic validation of a TradingThesis.
 No LLM. No opinions. Hard rules only.
 
-The LLM cannot override, argue with, or bypass these checks.
+Nothing upstream can override, argue with, or bypass these checks.
 If validate() returns False, the trade does not happen. Period.
 """
 from __future__ import annotations
@@ -34,7 +34,7 @@ def validate(
     Validate a trading thesis against deterministic risk rules.
 
     Args:
-        thesis: The thesis produced by ResearchAgent
+        thesis: The thesis produced by thesis_builder.build_thesis()
         state: Current system state (positions, P&L, block status)
         balance: Current available balance (used for daily loss % check)
 
@@ -67,7 +67,7 @@ def validate(
     if len(thesis.reasoning.strip()) < _MIN_REASONING_LEN:
         return (
             False,
-            f"reasoning too short ({len(thesis.reasoning)} chars) — LLM must justify",
+            f"reasoning too short ({len(thesis.reasoning)} chars) — thesis must justify itself",
         )
 
     # Rule 4: daily loss block

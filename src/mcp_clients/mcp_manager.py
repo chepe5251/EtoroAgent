@@ -25,17 +25,13 @@ _SERVERS_DIR = Path(__file__).parent.parent / "mcp_servers"
 # Value is either a python script filename (relative to _SERVERS_DIR, run with
 # the current interpreter) or a {"command", "args", "env"} spec for a
 # non-python server (e.g. an npx-launched Node MCP server).
+#
+# The bot is 100% rule-based (no LLM) — the only MCP tool actually called
+# in production is indicators_full_analysis (see orchestrator._fetch_price_and_atr).
+# etoro/finnhub/cryptopanic/reddit/exa were used by the LLM ReAct research
+# loop that has since been replaced by src/agents/thesis_builder.py.
 _DEFAULT_SERVERS: dict[str, str | dict] = {
-    "etoro":       "etoro_server.py",
     "indicators":  "indicators_server.py",
-    "finnhub":     "finnhub_server.py",
-    "cryptopanic": "cryptopanic_server.py",
-    "reddit":      "reddit_server.py",
-    "exa": {
-        "command": "npx",
-        "args": ["-y", "exa-mcp-server"],
-        "env": {"EXA_API_KEY": os.getenv("EXA_API_KEY", "")},
-    },
 }
 
 

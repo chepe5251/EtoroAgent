@@ -67,16 +67,31 @@ class BacktestConfig:
     vol_multiplier: float = 1.5         # volume > N× 20-day avg
 
     # Filters
-    use_trend_filter: bool = True        # require close > SMA200 for long entry
+    use_trend_filter: bool = True        # require an uptrend for long entry
+    trend_filter_type: str = "sma200"    # "sma200" (close>SMA200) | "ema50_200" (EMA50>EMA200)
     use_rsi_signal: bool = True          # enable RSI reversal entries
     use_ema_signal: bool = True          # enable EMA crossover entries
     ema_cross_lookback: int = 3          # cross must have happened in last N bars
+    use_breakout_signal: bool = False    # enable Donchian breakout entries
+    donchian_lookback: int = 20          # breakout = close > highest high of prior N bars
+    use_pullback_signal: bool = False    # enable EMA20 pullback-resume entries
+    profit_target_pct: float = 0.0       # 0 = disabled; fixed take-profit % (any exit mode)
+    use_structure_filter: bool = False   # require HH/HL market structure to be bullish (see market_structure.py)
+    structure_swing_k: int = 2           # bars each side to confirm a swing pivot
 
     # Sizing
     initial_equity: float = 10_000.0
     risk_per_trade_pct: float = 1.0      # % of equity to risk per trade
     atr_stop_multiple: float = 1.5       # stop = k×ATR from entry
     max_notional_pct: float = 10.0       # cap single position at 10% notional
+    leverage: float = 1.0                # scales the notional cap only — risk
+                                          # per trade (stop-distance sizing) is
+                                          # unchanged; leverage just lets a
+                                          # position grow bigger before hitting
+                                          # the notional cap. Carry cost and P&L
+                                          # already scale with notional, so a
+                                          # bigger cap here correctly reflects
+                                          # a bigger real-money cost/swing.
 
     # Exits
     exit_mode: str = "mean_reversion"    # "mean_reversion" | "trailing"
@@ -100,13 +115,15 @@ class BacktestConfig:
     equity_carry_daily_pct: float = 0.01   # %/day of notional
 
     # Crypto (eToro crypto CFDs)
-    # Source: eToro crypto spread page (BTC ~0.75%, ETH ~1.9%, altcoins up to 3%).
-    #   - Spread:     use 0.75% as conservative average across BTC/ETH/SOL
+    # Source: eToro's own fee page — flat 1% per side for Bronze/Silver/Gold
+    # tiers (confirmed 2026). Overnight CFD financing fee is charged nightly
+    # Mon-Fri, and the Friday-night charge is tripled to cover the Sat+Sun
+    # rollover. This weekend 3x multiplier IS modelled explicitly — see
+    # _weighted_carry_nights() below, applied at both carry-cost sites.
+    #   - Spread:     1.0% flat (Bronze/Silver/Gold; lower for Platinum+/Diamond)
     #   - Slippage:   0.25% (thinner order book than equities)
-    #   - Carry:      eToro charges an overnight CFD financing fee; for crypto
-    #                 this is typically 0.05–0.10%/night (≈18–36%/yr).
-    #                 We use 0.06%/day ≈ 22%/yr as the conservative default.
-    crypto_spread_pct: float = 0.75
+    #   - Carry:      base nightly rate below; Friday nights charged at 3x.
+    crypto_spread_pct: float = 1.0
     crypto_slippage_pct: float = 0.25
     crypto_commission_pct: float = 0.0
     crypto_carry_daily_pct: float = 0.06   # %/day of notional
@@ -127,6 +144,35 @@ class BacktestConfig:
         if asset_class == "crypto":
             return self.crypto_carry_daily_pct / 100.0
         return self.equity_carry_daily_pct / 100.0
+
+
+def _weighted_carry_nights(entry_date: object, exit_date: object, holding_days: int) -> float:
+    """Count nights a position is held open, weighting Friday nights at 3x.
+
+    eToro charges overnight CFD financing once per calendar night Mon-Fri,
+    and bundles the Sat+Sun rollover into a single Friday-night charge at
+    3x the standard rate. A position entered Monday and exited the
+    following Monday is held 7 nights, one of which is a Friday — so it
+    is charged as if it were 9 nights (4 weekday nights + 1 Friday x3).
+
+    Falls back to a flat 1x/night (`holding_days`) when the index isn't a
+    real calendar DatetimeIndex (e.g. synthetic integer-indexed test data),
+    since weekday weighting is meaningless without real dates.
+    """
+    try:
+        entry_ts = pd.Timestamp(entry_date)
+        exit_ts = pd.Timestamp(exit_date)
+    except (TypeError, ValueError):
+        return float(holding_days)
+    if entry_ts.year < 1980 or exit_ts.year < 1980:
+        return float(holding_days)
+    entry_ts = entry_ts.normalize()
+    exit_ts = exit_ts.normalize()
+    if exit_ts <= entry_ts:
+        return float(holding_days)
+    nights = pd.date_range(entry_ts, exit_ts, freq="D")[:-1]
+    weights = np.where(nights.weekday == 4, 3.0, 1.0)
+    return float(weights.sum())
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -165,6 +211,7 @@ class Trade:
     signal_type: str
     asset_class: str
     carry_cost: float = 0.0              # $ carry deducted (for transparency)
+    is_short: bool = False                # True for short-side trades (e.g. First Red Day)
 
 
 @dataclass
@@ -176,6 +223,45 @@ class RunResult:
     initial_equity: float = 10_000.0
     n_bars: int = 0
     period_label: str = ""
+
+
+def _structure_trend_series(df: pd.DataFrame, k: int) -> list[bool]:
+    """
+    Bar-by-bar "is market structure bullish" flag, per market_structure.py's
+    HH/HL swing logic (a swing pivot is confirmed k bars after it forms, so
+    this carries zero look-ahead: the flag at bar i only reflects swings
+    confirmable using bars up to i).
+    """
+    highs = df["high"].to_numpy()
+    lows = df["low"].to_numpy()
+    n = len(df)
+    is_sh = [False] * n
+    is_sl = [False] * n
+    for i in range(k, n - k):
+        window_h = highs[i - k : i + k + 1]
+        if highs[i] >= window_h.max() and (window_h == highs[i]).sum() == 1:
+            is_sh[i] = True
+        window_l = lows[i - k : i + k + 1]
+        if lows[i] <= window_l.min() and (window_l == lows[i]).sum() == 1:
+            is_sl[i] = True
+
+    swing_highs: list[float] = []
+    swing_lows: list[float] = []
+    bullish = [False] * n
+    trend = False
+    for i in range(n):
+        confirm_idx = i - k
+        if confirm_idx >= 0:
+            if is_sh[confirm_idx]:
+                swing_highs.append(highs[confirm_idx])
+            if is_sl[confirm_idx]:
+                swing_lows.append(lows[confirm_idx])
+            if len(swing_highs) >= 2 and len(swing_lows) >= 2:
+                hh = swing_highs[-1] > swing_highs[-2]
+                hl = swing_lows[-1] > swing_lows[-2]
+                trend = hh and hl
+        bullish[i] = trend
+    return bullish
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -225,6 +311,12 @@ def _add_indicators(df: pd.DataFrame, cfg: BacktestConfig) -> pd.DataFrame:
 
     # ── SMA200 (trend filter) ────────────────────────────────────────────────
     df["sma200"] = df["close"].rolling(cfg.sma_trend, min_periods=cfg.sma_trend).mean()
+    df["ema200"] = df["close"].ewm(span=cfg.sma_trend, adjust=False,
+                                   min_periods=cfg.sma_trend).mean()
+
+    # ── EMA20 pullback-resume (close crosses back above EMA20) ──────────────
+    above_ema20 = df["close"] > df["ema20"]
+    df["pullback_resume"] = above_ema20 & ~above_ema20.shift(1).fillna(False).astype(bool)
 
     # ── ATR (Wilder smoothing, period=14) ────────────────────────────────────
     hl   = df["high"] - df["low"]
@@ -238,6 +330,17 @@ def _add_indicators(df: pd.DataFrame, cfg: BacktestConfig) -> pd.DataFrame:
     vol_prev_avg = df["volume"].shift(1).rolling(20, min_periods=20).mean()
     df["rel_vol"] = df["volume"] / vol_prev_avg
 
+    # ── Donchian channel high (trend-following breakout) ────────────────────
+    # shift(1) excludes the current bar so "breakout" means close[i] clears
+    # the highest high of the PRIOR N bars — no look-ahead.
+    df["donchian_high"] = (
+        df["high"].shift(1).rolling(cfg.donchian_lookback, min_periods=cfg.donchian_lookback).max()
+    )
+
+    # ── Market structure (HH/HL) bullish gate, computed on demand only ──────
+    if cfg.use_structure_filter:
+        df["structure_bullish"] = _structure_trend_series(df, cfg.structure_swing_k)
+
     return df
 
 
@@ -245,7 +348,7 @@ def _add_indicators(df: pd.DataFrame, cfg: BacktestConfig) -> pd.DataFrame:
 # Signal logic
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _entry_signal(row: pd.Series, cfg: BacktestConfig) -> Optional[str]:
+def _entry_signal(row: pd.Series, cfg: BacktestConfig, asset_class: str = "equity") -> Optional[str]:
     """
     Return signal type if entry conditions are met for the LONG side, else None.
 
@@ -256,20 +359,41 @@ def _entry_signal(row: pd.Series, cfg: BacktestConfig) -> Optional[str]:
     # Need valid ATR for stop sizing
     if not np.isfinite(row.get("atr", np.nan)) or row["atr"] <= 0:
         return None
-    # Relative volume confirmation
-    if not np.isfinite(row.get("rel_vol", np.nan)):
+    # Relative volume confirmation — eToro's real API never reports crypto
+    # volume (always None), so a permanently-NaN rel_vol would otherwise
+    # block every crypto entry forever. Skip the volume gate for crypto;
+    # keep it as a hard requirement for equities where real volume exists.
+    rel_vol = row.get("rel_vol", np.nan)
+    if np.isfinite(rel_vol):
+        vol_ok = rel_vol >= cfg.vol_multiplier
+    elif asset_class == "crypto":
+        vol_ok = True
+    else:
         return None
-    vol_ok = row["rel_vol"] >= cfg.vol_multiplier
 
     # Trend filter
     trend_ok = True
     if cfg.use_trend_filter:
-        sma = row.get("sma200", np.nan)
-        if not np.isfinite(sma):
-            return None  # no trend data yet — skip
-        trend_ok = row["close"] > sma
+        if cfg.trend_filter_type == "ema50_200":
+            ema50 = row.get("ema50", np.nan)
+            ema200 = row.get("ema200", np.nan)
+            if not (np.isfinite(ema50) and np.isfinite(ema200)):
+                return None  # no trend data yet — skip
+            trend_ok = ema50 > ema200
+        else:
+            sma = row.get("sma200", np.nan)
+            if not np.isfinite(sma):
+                return None  # no trend data yet — skip
+            trend_ok = row["close"] > sma
 
     if not trend_ok:
+        return None
+
+    # Market-structure (HH/HL) gate — abstain unless swing structure is
+    # confirmed bullish, e.g. if EMA-based trend_ok fired but price is
+    # trading below the last significant swing low (structure broken/at risk
+    # of ChoCh).
+    if cfg.use_structure_filter and not row.get("structure_bullish", False):
         return None
 
     # ── Signal A: RSI reversal ───────────────────────────────────────────────
@@ -285,6 +409,17 @@ def _entry_signal(row: pd.Series, cfg: BacktestConfig) -> Optional[str]:
     if cfg.use_ema_signal:
         if row.get("ema_cross_recent", False) and vol_ok:
             return "ema_cross"
+
+    # ── Signal C: Donchian breakout (trend-following) ────────────────────────
+    if cfg.use_breakout_signal:
+        donchian_high = row.get("donchian_high", np.nan)
+        if np.isfinite(donchian_high) and row["close"] > donchian_high and vol_ok:
+            return "breakout"
+
+    # ── Signal D: EMA20 pullback-resume (trend-following) ────────────────────
+    if cfg.use_pullback_signal:
+        if row.get("pullback_resume", False) and vol_ok:
+            return "pullback"
 
     return None
 
@@ -383,15 +518,23 @@ def run(
                 exit_price = raw * (1.0 - pos_cost)
                 exit_reason = "stop_loss"
 
+            # 1b. Fixed profit target (any exit mode, checked after stop loss)
+            if exit_price is None and cfg.profit_target_pct > 0:
+                target_price = pos.entry_price * (1.0 + cfg.profit_target_pct / 100.0)
+                if row["high"] >= target_price:
+                    raw = row["open"] if row["open"] >= target_price else target_price
+                    exit_price = raw * (1.0 - pos_cost)
+                    exit_reason = "profit_target"
+
             # 2. Trailing stop — with gap-through check (A2)
-            elif cfg.exit_mode == "trailing" and pos.trail_stop > 0:
+            if exit_price is None and cfg.exit_mode == "trailing" and pos.trail_stop > 0:
                 if row["low"] <= pos.trail_stop:
                     raw = _gap_fill(row["open"], pos.trail_stop, "long")
                     exit_price = raw * (1.0 - pos_cost)
                     exit_reason = "trail_stop"
 
             # 3. Time limit → fill at next bar's open
-            elif (i - pos.entry_bar) >= cfg.max_hold_days:
+            if exit_price is None and (i - pos.entry_bar) >= cfg.max_hold_days:
                 if i + 1 < n:
                     exit_price = df_ind.iloc[i + 1]["open"] * (1.0 - pos_cost)
                 else:
@@ -399,7 +542,7 @@ def run(
                 exit_reason = "time_limit"
 
             # 4. Mean-reversion TP → fill at next bar's open
-            elif cfg.exit_mode == "mean_reversion":
+            if exit_price is None and cfg.exit_mode == "mean_reversion":
                 rsi_val = row.get("rsi", np.nan)
                 if np.isfinite(rsi_val) and rsi_val >= cfg.tp_rsi_level:
                     if i + 1 < n:
@@ -408,10 +551,21 @@ def run(
                         exit_price = row["close"] * (1.0 - pos_cost)
                     exit_reason = "tp_rsi"
 
+            # 5. Trend break → fill at next bar's open
+            if exit_price is None and cfg.exit_mode == "trend_break":
+                ema50_val = row.get("ema50", np.nan)
+                if np.isfinite(ema50_val) and row["close"] < ema50_val:
+                    if i + 1 < n:
+                        exit_price = df_ind.iloc[i + 1]["open"] * (1.0 - pos_cost)
+                    else:
+                        exit_price = row["close"] * (1.0 - pos_cost)
+                    exit_reason = "trend_break"
+
             if exit_price is not None:
                 holding_days = i - pos.entry_bar
-                # A3: deduct overnight carry from P&L
-                carry_cost = pos.notional * cfg.daily_carry(pos.asset_class) * holding_days
+                # A3: deduct overnight carry from P&L (weekend nights count 3x)
+                carry_nights = _weighted_carry_nights(pos.entry_date, df_ind.index[i], holding_days)
+                carry_cost = pos.notional * cfg.daily_carry(pos.asset_class) * carry_nights
                 units = pos.notional / pos.entry_price
                 raw_pnl = (exit_price - pos.entry_price) * units
                 pnl = raw_pnl - carry_cost
@@ -449,7 +603,7 @@ def run(
         if i >= warmup and i < n - 1 and len(positions) < cfg.max_positions:
             open_symbols = {p.symbol for p in positions}
             if symbol not in open_symbols:
-                sig = _entry_signal(row, cfg)
+                sig = _entry_signal(row, cfg, asset_class=asset_class)
                 if sig:
                     next_row = df_ind.iloc[i + 1]
                     entry_price = next_row["open"] * (1.0 + cost)
@@ -459,7 +613,7 @@ def run(
                         risk_amount = realised_equity * (cfg.risk_per_trade_pct / 100.0)
                         units = risk_amount / stop_dist
                         notional = units * entry_price
-                        max_notional = realised_equity * (cfg.max_notional_pct / 100.0)
+                        max_notional = realised_equity * (cfg.max_notional_pct * cfg.leverage / 100.0)
                         notional = min(notional, max_notional)
                         if notional >= 1.0 and realised_equity > 0:
                             positions.append(_OpenPosition(
@@ -485,7 +639,8 @@ def run(
         pos_cost = cfg.cost_per_side(pos.asset_class)
         last_price = last_row["close"] * (1.0 - pos_cost)
         holding_days = n - 1 - pos.entry_bar
-        carry_cost = pos.notional * cfg.daily_carry(pos.asset_class) * holding_days
+        carry_nights = _weighted_carry_nights(pos.entry_date, df_ind.index[-1], holding_days)
+        carry_cost = pos.notional * cfg.daily_carry(pos.asset_class) * carry_nights
         units = pos.notional / pos.entry_price
         raw_pnl = (last_price - pos.entry_price) * units
         pnl = raw_pnl - carry_cost

@@ -1,11 +1,16 @@
 """
 Orchestrator — swing trading, market-calendar-driven schedule.
 
+100% rule-based. No LLM anywhere in this pipeline — see
+src/agents/thesis_builder.py and src/backtest/engine.py for the validated
+breakout/pullback trend-following rules this runs on (out-of-sample profit
+factor 1.60 across 140 real symbols, 5 years, real fees + leverage).
+
 Architecture:
-  REASONING PLANE  → ScreeningAgent (deterministic+LLM fast filter)
-                   → ResearchAgent  (full ReAct per shortlisted symbol)
+  SIGNAL PLANE     → ScreeningAgent (deterministic technical filter)
+                   → thesis_builder (deterministic TradingThesis from the signal)
   EXECUTION PLANE  → RiskGate → ExecutionAgent (no LLM)
-  REVIEW PLANE     → PositionReviewAgent (ReAct, 1×/day per position)
+  REVIEW PLANE     → PositionReviewAgent (deterministic technical check, 1×/day)
   MAINTENANCE      → TrailingStopAgent (every 60 min, deterministic)
 
 Schedule per region (5 min after market open):
@@ -36,8 +41,8 @@ from src.agents import risk_gate as risk_gate_module
 from src.agents.execution_agent import ExecutionAgent, size_position
 from src.agents.notification_agent import NotificationAgent
 from src.agents.position_review_agent import PositionReviewAgent
-from src.agents.research_agent import ResearchAgent
-from src.agents.screening_agent import ScreeningAgent
+from src.agents.screening_agent import ScreeningAgent, ScreeningResult
+from src.agents.thesis_builder import build_thesis
 from src.agents.trailing_stop_agent import TrailingStopAgent
 from src.config.universe import get_symbols, get_instrument_id as cache_instrument_id
 from src.core.etoro_client import EtoroClient
@@ -65,12 +70,10 @@ class Orchestrator:
         self.mcp_manager = MCPManager()
 
         self.notification_agent = NotificationAgent(self.state)
-        self.research_agent = ResearchAgent(self.mcp_manager)
         self.screening_agent = ScreeningAgent(self.client)
         self.execution_agent = ExecutionAgent(self.client, self.state, self.notification_agent)
         self.trailing_stop_agent = TrailingStopAgent(self.client, self.state)
         self.position_review_agent = PositionReviewAgent(
-            mcp_manager=self.mcp_manager,
             execution_agent=self.execution_agent,
             notification_agent=self.notification_agent,
             state=self.state,
@@ -189,28 +192,30 @@ class Orchestrator:
             logger.info("Screening %s: empty shortlist", region)
             return
 
-        logger.info("Screening %s: researching shortlist=%s", region, shortlist)
+        logger.info(
+            "Screening %s: shortlist=%s", region, [r.symbol for r in shortlist]
+        )
 
-        # Compute unrealized P&L once before the research loop (P1-4)
+        # Compute unrealized P&L once before the execution loop (P1-4)
         unrealized_pnl = self._unrealized_pnl()
 
-        for symbol in shortlist:
+        for result in shortlist:
             try:
-                await self._research_and_execute(symbol, balance, unrealized_pnl)
+                await self._build_and_execute(result, balance, unrealized_pnl)
             except Exception as exc:
-                logger.error("Error on %s: %s", symbol, exc, exc_info=True)
+                logger.error("Error on %s: %s", result.symbol, exc, exc_info=True)
                 await self.notification_agent.send_critical_error(
-                    f"Error processing {symbol}: {exc}"
+                    f"Error processing {result.symbol}: {exc}"
                 )
 
         self.state.last_updated = _utcnow()
         logger.info("=== Screening %s complete ===", region)
 
-    async def _research_and_execute(self, symbol: str, balance: float, unrealized_pnl: float):
-        thesis = await self.research_agent.run(symbol)
-        if thesis is None:
-            logger.warning("%s: no thesis produced", symbol)
-            return
+    async def _build_and_execute(
+        self, result: ScreeningResult, balance: float, unrealized_pnl: float
+    ):
+        thesis = build_thesis(result)
+        symbol = thesis.symbol
 
         approved, reason = risk_gate_module.validate(
             thesis, self.state, balance, unrealized_pnl=unrealized_pnl
@@ -287,7 +292,7 @@ class Orchestrator:
 
         broker_ids: dict[str, dict] = {}
         for item in portfolio:
-            pid = str(item.get("positionId", item.get("id", "")))
+            pid = str(item.get("positionId") or item.get("id") or "")
             if pid:
                 broker_ids[pid] = item
 
@@ -296,7 +301,7 @@ class Orchestrator:
             if pos.position_id in broker_ids:
                 item = broker_ids[pos.position_id]
                 pos.current_rate = float(
-                    item.get("currentRate", item.get("rate", pos.current_rate))
+                    item.get("currentRate") or item.get("rate") or pos.current_rate
                 )
             else:
                 logger.warning(
@@ -376,7 +381,7 @@ class Orchestrator:
             try:
                 rates = await self.client.get_rates([symbol])
                 rate_info = rates.get(symbol, {})
-                price = float(rate_info.get("close", rate_info.get("bid", 0)))
+                price = float(rate_info.get("close") or rate_info.get("bid") or 0)
                 return price, 0.0
             except Exception:
                 return 0.0, 0.0

@@ -20,7 +20,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_MAX_POSITION_SIZE_PCT = float(os.getenv("MAX_POSITION_SIZE_PCT", "2.0"))
+_MAX_POSITION_SIZE_PCT = float(os.getenv("MAX_POSITION_SIZE_PCT", "10.0"))
+_RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "1.0"))
+_LEVERAGE = float(os.getenv("LEVERAGE", "1.0"))
 
 
 def _utcnow() -> datetime:
@@ -29,13 +31,19 @@ def _utcnow() -> datetime:
 
 @dataclass
 class SizedOrder:
-    """Fully computed order ready for execution. Created by size_position()."""
+    """Fully computed order ready for execution. Created by size_position().
+
+    amount_usd is NOTIONAL exposure (matches src/backtest/engine.py's
+    accounting) — ExecutionAgent converts to broker margin (amount_usd /
+    leverage) when submitting the real order.
+    """
     thesis: TradingThesis
     instrument_id: str
     amount_usd: float
     stop_loss_pct: float
     current_price: float
     atr: float
+    leverage: float = _LEVERAGE
 
 
 def size_position(
@@ -46,16 +54,25 @@ def size_position(
     atr: float,
 ) -> SizedOrder:
     """
-    Deterministic position sizing.
-    - Amount: MAX_POSITION_SIZE_PCT % of available balance
-    - Stop-loss: thesis.suggested_stop_loss_atr_multiple × ATR as % of price
+    Risk-based position sizing — matches src/backtest/engine.py exactly:
+      - Stop distance = suggested_stop_loss_atr_multiple × ATR
+      - risk_amount = balance × RISK_PER_TRADE_PCT%
+      - units = risk_amount / stop_distance ; notional = units × price
+      - capped at MAX_POSITION_SIZE_PCT% × LEVERAGE of balance
     """
-    amount_usd = balance * (_MAX_POSITION_SIZE_PCT / 100.0)
-    amount_usd = round(amount_usd, 2)
-
     sl_distance = thesis.suggested_stop_loss_atr_multiple * atr if atr else current_price * 0.02
     stop_loss_pct = (sl_distance / current_price * 100) if current_price else 2.0
     stop_loss_pct = round(stop_loss_pct, 4)
+
+    notional = 0.0
+    if sl_distance > 0 and current_price > 0 and balance > 0:
+        risk_amount = balance * (_RISK_PER_TRADE_PCT / 100.0)
+        units = risk_amount / sl_distance
+        notional = units * current_price
+
+    max_notional = balance * (_MAX_POSITION_SIZE_PCT / 100.0 * _LEVERAGE)
+    amount_usd = min(notional, max_notional)
+    amount_usd = round(amount_usd, 2)
 
     return SizedOrder(
         thesis=thesis,
@@ -64,6 +81,7 @@ def size_position(
         stop_loss_pct=stop_loss_pct,
         current_price=current_price,
         atr=atr,
+        leverage=_LEVERAGE,
     )
 
 
@@ -87,19 +105,22 @@ class ExecutionAgent:
         """
         is_buy = order.thesis.action == "buy"
         symbol = order.thesis.symbol
+        leverage = max(1, round(order.leverage))
+        margin_usd = round(order.amount_usd / leverage, 2)
         logger.info(
-            "ExecutionAgent: opening %s %s $%.2f sl=%.4f%%",
-            "BUY" if is_buy else "SELL", symbol, order.amount_usd, order.stop_loss_pct,
+            "ExecutionAgent: opening %s %s notional=$%.2f margin=$%.2f leverage=%dx sl=%.4f%%",
+            "BUY" if is_buy else "SELL", symbol, order.amount_usd, margin_usd, leverage, order.stop_loss_pct,
         )
 
         try:
             result = await self.client.open_position(
                 instrument_id=order.instrument_id,
-                amount_usd=order.amount_usd,
+                amount_usd=margin_usd,
                 is_buy=is_buy,
                 stop_loss_pct=order.stop_loss_pct,
                 current_price=order.current_price,
                 trailing_stop=True,
+                leverage=leverage,
             )
         except Exception as exc:
             msg = f"Failed to open {symbol}: {exc}"
@@ -108,9 +129,9 @@ class ExecutionAgent:
             return False
 
         position_id = str(
-            result.get("positionId", result.get("id", result.get("position_id", f"unknown-{symbol}")))
+            result.get("positionId") or result.get("id") or result.get("position_id") or f"unknown-{symbol}"
         )
-        rate = float(result.get("rate", result.get("openRate", 0)))
+        rate = float(result.get("rate") or result.get("openRate") or 0)
 
         pos = Position(
             position_id=position_id,
@@ -125,6 +146,7 @@ class ExecutionAgent:
             atr=order.atr,
             horizon_days=order.thesis.horizon_days,
             invalidation_condition=order.thesis.invalidation_condition,
+            leverage=order.leverage,
         )
         self.state.open_positions.append(pos)
         self.state.save()  # persist immediately so state survives a crash
@@ -161,7 +183,21 @@ class ExecutionAgent:
             )
             return False
 
-        close_rate = float(result.get("rate", result.get("closeRate", pos.current_rate)))
+        # First try to get the actual close rate from the API response
+        close_rate_raw = result.get("rate") or result.get("closeRate")
+        if close_rate_raw is not None:
+            close_rate = float(close_rate_raw)
+        else:
+            # The close-position response never includes a rate — fetch a live
+            # quote instead of trusting a possibly-stale/zero current_rate.
+            try:
+                rates = await self.client.get_rates([pos.symbol])
+                quote = rates.get(pos.symbol)
+                live_rate = quote.get("lastExecution") or quote.get("bid") if quote else None
+            except Exception as exc:
+                logger.warning("get_rates failed for %s close: %s", pos.symbol, exc)
+                live_rate = None
+            close_rate = float(live_rate) if live_rate else pos.current_rate
         if pos.is_buy:
             pnl = (close_rate - pos.entry_rate) / pos.entry_rate * pos.amount_usd
         else:

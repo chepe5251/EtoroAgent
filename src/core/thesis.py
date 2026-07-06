@@ -1,5 +1,5 @@
 """
-TradingThesis — the structured output that ResearchAgent produces.
+TradingThesis — the structured output produced by thesis_builder.build_thesis().
 This is the contract between the agentic reasoning plane and the
 deterministic execution plane. Every field must be present and typed;
 the risk gate validates this schema before any order is considered.
