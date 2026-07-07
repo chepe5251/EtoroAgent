@@ -67,6 +67,19 @@ _REGION_CONFIGS: dict[str, dict] = {
         "open_h": 9, "open_m": 30,
         "close_h": 16, "close_m": 0,
     },
+    "JAPAN": {
+        # Genuine Tokyo Stock Exchange listings (Toyota, Sony, Nintendo, etc.,
+        # priced in JPY) — distinct instrument IDs from the US-listed ADRs
+        # already in "ASIA". eToro only added these in Q1 2026, so daily
+        # history is short (~67 bars as of mid-2026) — NOT yet backtest-
+        # validated (needs 250+ bars). Added anyway per explicit request;
+        # treat with extra caution until enough history accumulates.
+        "calendar": "XTKS",
+        "fallback": ["JPX"],
+        "tz": "Asia/Tokyo",
+        "open_h": 9, "open_m": 0,
+        "close_h": 15, "close_m": 0,
+    },
     "CRYPTO": {
         "calendar": None,
         "fallback": [],

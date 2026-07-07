@@ -24,6 +24,11 @@ fills happen as close to the opening price as possible:
           hourly volume — see market_calendar.py)
   HONGKONG: scan 09:15, execute 09:30 Asia/Hong_Kong — genuine HKEX listings
           (Tencent, HSBC, AIA...), unlike "ASIA" these really do trade HKEX hours
+  JAPAN:  scan 08:45, execute 09:00 Asia/Tokyo — genuine Tokyo Stock Exchange
+          listings (Toyota, Sony, Nintendo... priced in JPY, distinct
+          instrument IDs from the "ASIA" ADRs). eToro only added these in
+          Q1 2026 so daily history is short (~67 bars) — NOT yet backtest-
+          validated (needs 250+ bars). Included anyway per explicit request.
   CRYPTO: scan+execute together, every 6 hours UTC (no market open concept)
 
 Daily:
@@ -137,6 +142,8 @@ class Orchestrator:
                           execute=dict(hour=9, minute=30, timezone="America/New_York")),
             "HONGKONG": dict(scan=dict(hour=9, minute=15, timezone="Asia/Hong_Kong"),
                               execute=dict(hour=9, minute=30, timezone="Asia/Hong_Kong")),
+            "JAPAN": dict(scan=dict(hour=8, minute=45, timezone="Asia/Tokyo"),
+                          execute=dict(hour=9, minute=0, timezone="Asia/Tokyo")),
         }
         for region in _REGIONS:
             if region == "CRYPTO":
