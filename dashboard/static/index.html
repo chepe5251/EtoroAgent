@@ -85,15 +85,34 @@
   .pnl-neg { color: var(--critical); }
   .empty { color: var(--text-muted); font-size: 13px; padding: 24px 0; text-align: center; }
   #chart-wrap { position: relative; }
-  #chart-tooltip {
+  .viz-tooltip {
     position: absolute; pointer-events: none; background: var(--surface-1);
     border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
     font-size: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.12); display: none; white-space: nowrap;
+    z-index: 10;
   }
-  #chart-tooltip .tt-value { font-weight: 700; color: var(--text-primary); }
-  #chart-tooltip .tt-label { color: var(--text-secondary); }
+  .viz-tooltip .tt-value { font-weight: 700; color: var(--text-primary); }
+  .viz-tooltip .tt-label { color: var(--text-secondary); }
   .activity-feed { max-height: 260px; overflow-y: auto; font-family: ui-monospace, monospace; font-size: 12px; color: var(--text-secondary); line-height: 1.6; }
   .risk-block { color: var(--critical); font-weight: 600; margin-bottom: 8px; }
+
+  .charts-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 700px) { .charts-grid { grid-template-columns: 1fr; } }
+  .chart-wrap-rel { position: relative; }
+  .hbar-empty { color: var(--text-muted); font-size: 13px; padding: 16px 0; text-align: center; }
+
+  .tile { position: relative; overflow: hidden; transition: box-shadow 0.15s ease; }
+  .tile:hover { box-shadow: 0 2px 10px rgba(0,0,0,0.06); }
+  .tile .sparkline { position: absolute; bottom: 0; left: 0; right: 0; height: 28px; opacity: 0.9; }
+  .card { transition: box-shadow 0.15s ease; }
+  tbody tr { transition: background 0.1s ease; }
+  tbody tr:hover { background: var(--series-1-wash); }
+
+  .hbar-svg .hbar-track { fill: var(--grid); }
+  .hbar-svg text { font-size: 11px; fill: var(--text-secondary); }
+  .hbar-svg .hbar-value { font-weight: 700; fill: var(--text-primary); font-variant-numeric: tabular-nums; }
+  .hbar-svg .hbar-mark { cursor: pointer; }
+  .hbar-svg .hbar-mark:hover { filter: brightness(1.08); }
 </style>
 </head>
 <body>
@@ -110,7 +129,10 @@
     <div class="tile"><div class="label">P&amp;L del día</div><div class="value" id="tile-daily-pnl">—</div></div>
     <div class="tile"><div class="label">Posiciones abiertas</div><div class="value" id="tile-positions">—</div></div>
     <div class="tile"><div class="label">Win rate</div><div class="value" id="tile-winrate">—</div><div class="delta" id="tile-winrate-sub"></div></div>
-    <div class="tile"><div class="label">P&amp;L total realizado</div><div class="value" id="tile-total-pnl">—</div></div>
+    <div class="tile">
+      <div class="label">P&amp;L total realizado</div><div class="value" id="tile-total-pnl">—</div>
+      <svg class="sparkline" id="tile-sparkline" viewBox="0 0 200 28" preserveAspectRatio="none"></svg>
+    </div>
   </div>
 
   <div class="card" id="risk-card" style="display:none">
@@ -122,6 +144,23 @@
     <div id="regions-table"></div>
   </div>
 
+  <div class="charts-grid">
+    <div class="card">
+      <h2>P&amp;L por región</h2>
+      <div class="chart-wrap-rel" id="region-pnl-wrap">
+        <svg class="hbar-svg" id="region-pnl-chart" width="100%" height="180" viewBox="0 0 400 180" preserveAspectRatio="none"></svg>
+        <div class="viz-tooltip" id="region-pnl-tooltip"></div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Win rate por región</h2>
+      <div class="chart-wrap-rel" id="region-winrate-wrap">
+        <svg class="hbar-svg" id="region-winrate-chart" width="100%" height="180" viewBox="0 0 400 180" preserveAspectRatio="none"></svg>
+        <div class="viz-tooltip" id="region-winrate-tooltip"></div>
+      </div>
+    </div>
+  </div>
+
   <div class="card">
     <h2>Posiciones abiertas</h2>
     <div id="positions-table"></div>
@@ -131,7 +170,15 @@
     <h2>Curva de P&amp;L realizado (acumulado)</h2>
     <div id="chart-wrap">
       <svg id="equity-chart" width="100%" height="220" viewBox="0 0 800 220" preserveAspectRatio="none"></svg>
-      <div id="chart-tooltip"></div>
+      <div class="viz-tooltip" id="chart-tooltip"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Distribución de P&amp;L por operación</h2>
+    <div class="chart-wrap-rel" id="histogram-wrap">
+      <svg id="pnl-histogram" width="100%" height="180" viewBox="0 0 800 180" preserveAspectRatio="none"></svg>
+      <div class="viz-tooltip" id="histogram-tooltip"></div>
     </div>
   </div>
 
@@ -208,6 +255,159 @@ function renderRegions(regions) {
   el.innerHTML = `<table><thead><tr>
     <th>Región</th><th>Símbolos</th><th>Abiertas</th><th>Cerrados</th><th>Win rate</th><th>P&L</th><th>Próx. scan</th><th>Próx. ejecución</th>
   </tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+// Shared horizontal-bar renderer — used for "P&L por región" (diverging,
+// good/critical) and "Win rate por región" (single sequential hue).
+function renderHBarChart({ svgId, tooltipId, items, getLabel, getValue, getColor, formatValue, domainMin, domainMax }) {
+  const svg = document.getElementById(svgId);
+  const tooltip = document.getElementById(tooltipId);
+  svg.innerHTML = '';
+  if (!items.length) {
+    svg.innerHTML = `<text x="200" y="90" text-anchor="middle" fill="var(--text-muted)" font-size="13">Sin datos todavía</text>`;
+    return;
+  }
+  const W = 400, ROW_H = 34, PAD_LEFT = 74, PAD_RIGHT = 52, BAR_H = 18;
+  const H = items.length * ROW_H;
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  svg.setAttribute('height', H);
+
+  const values = items.map(getValue);
+  const domMin = domainMin != null ? domainMin : Math.min(0, ...values);
+  const domMax = domainMax != null ? domainMax : Math.max(0, ...values);
+  const range = (domMax - domMin) || 1;
+  const plotW = W - PAD_LEFT - PAD_RIGHT;
+  const scaleX = v => PAD_LEFT + ((v - domMin) / range) * plotW;
+  const zeroX = scaleX(0);
+
+  let parts = `<line x1="${zeroX}" y1="4" x2="${zeroX}" y2="${H - 4}" stroke="var(--baseline)" stroke-width="1"/>`;
+
+  items.forEach((item, i) => {
+    const v = getValue(item);
+    const label = getLabel(item);
+    const cy = i * ROW_H + ROW_H / 2;
+    const barY = cy - BAR_H / 2;
+    const x0 = Math.min(zeroX, scaleX(v));
+    const x1 = Math.max(zeroX, scaleX(v));
+    const barW = Math.max(x1 - x0, 1.5);
+    const color = getColor(item, v);
+    const valueStr = formatValue(v);
+    const labelIsLeft = v < 0;
+
+    parts += `<text x="${PAD_LEFT - 8}" y="${cy + 4}" text-anchor="end">${escapeText(label)}</text>`;
+    parts += `<rect class="hbar-mark" data-idx="${i}" x="${x0}" y="${barY}" width="${barW}" height="${BAR_H}" rx="3" fill="${color}"/>`;
+    parts += `<text class="hbar-value" x="${labelIsLeft ? x0 - 6 : x1 + 6}" y="${cy + 4}" text-anchor="${labelIsLeft ? 'end' : 'start'}">${escapeText(valueStr)}</text>`;
+  });
+
+  svg.innerHTML = parts;
+
+  svg.querySelectorAll('.hbar-mark').forEach(rect => {
+    const item = items[parseInt(rect.dataset.idx, 10)];
+    rect.addEventListener('pointermove', (ev) => {
+      const wrapRect = svg.parentElement.getBoundingClientRect();
+      tooltip.style.display = 'block';
+      tooltip.style.left = (ev.clientX - wrapRect.left + 12) + 'px';
+      tooltip.style.top = (ev.clientY - wrapRect.top - 10) + 'px';
+      tooltip.innerHTML = `<div class="tt-label">${escapeText(getLabel(item))}</div><div class="tt-value">${escapeText(formatValue(getValue(item)))}</div>`;
+    });
+    rect.addEventListener('pointerleave', () => { tooltip.style.display = 'none'; });
+  });
+}
+
+function renderRegionCharts(regions) {
+  const withActivity = regions.filter(r => r.closed_trades > 0 || r.open_positions > 0);
+  const rows = withActivity.length ? withActivity : regions;
+
+  renderHBarChart({
+    svgId: 'region-pnl-chart', tooltipId: 'region-pnl-tooltip', items: rows,
+    getLabel: r => r.region, getValue: r => r.total_pnl,
+    getColor: (r, v) => v >= 0 ? 'var(--good)' : 'var(--critical)',
+    formatValue: fmtUSD,
+  });
+
+  renderHBarChart({
+    svgId: 'region-winrate-chart', tooltipId: 'region-winrate-tooltip',
+    items: rows.filter(r => r.win_rate != null),
+    getLabel: r => r.region, getValue: r => r.win_rate,
+    getColor: () => 'var(--series-1)',
+    formatValue: fmtPct,
+    domainMin: 0, domainMax: 100,
+  });
+}
+
+function renderPnlHistogram(closedTrades) {
+  const svg = document.getElementById('pnl-histogram');
+  const tooltip = document.getElementById('histogram-tooltip');
+  svg.innerHTML = '';
+  if (closedTrades.length < 3) {
+    svg.innerHTML = `<text x="400" y="90" text-anchor="middle" fill="var(--text-muted)" font-size="13">Sin suficientes trades cerrados todavía para graficar</text>`;
+    return;
+  }
+  const W = 800, H = 180, PAD_L = 40, PAD_B = 24, PAD_T = 10;
+  const values = closedTrades.map(t => t.pnl);
+  const min = Math.min(...values), max = Math.max(...values);
+  const NBINS = 14;
+  const span = (max - min) || 1;
+  const binW = span / NBINS;
+  const bins = new Array(NBINS).fill(0).map((_, i) => ({ lo: min + i * binW, hi: min + (i + 1) * binW, count: 0 }));
+  values.forEach(v => {
+    let idx = Math.floor((v - min) / binW);
+    if (idx >= NBINS) idx = NBINS - 1;
+    if (idx < 0) idx = 0;
+    bins[idx].count++;
+  });
+  const maxCount = Math.max(...bins.map(b => b.count), 1);
+  const plotW = W - PAD_L - 10, plotH = H - PAD_B - PAD_T;
+  const gap = 2;
+  const slotW = plotW / NBINS;
+  const barW = Math.max(slotW - gap, 2);
+  const y = c => H - PAD_B - (c / maxCount) * plotH;
+  const zeroBinIdx = Math.min(NBINS - 1, Math.max(0, Math.floor((0 - min) / binW)));
+
+  let parts = '';
+  const yTicks = [0, Math.ceil(maxCount / 2), maxCount];
+  [...new Set(yTicks)].forEach(t => {
+    parts += `<line x1="${PAD_L}" y1="${y(t)}" x2="${W - 10}" y2="${y(t)}" stroke="var(--grid)" stroke-width="1"/>`;
+    parts += `<text x="${PAD_L - 8}" y="${y(t) + 3}" text-anchor="end">${t}</text>`;
+  });
+  parts += `<line x1="${PAD_L}" y1="${H - PAD_B}" x2="${W - 10}" y2="${H - PAD_B}" stroke="var(--baseline)" stroke-width="1"/>`;
+  bins.forEach((b, i) => {
+    const x = PAD_L + i * slotW + gap / 2;
+    const barH = (H - PAD_B) - y(b.count);
+    const isLoss = (b.lo + b.hi) / 2 < 0;
+    parts += `<rect class="hbar-mark" data-idx="${i}" x="${x}" y="${y(b.count)}" width="${barW}" height="${Math.max(barH, 0)}" rx="3" fill="${isLoss ? 'var(--critical)' : 'var(--good)'}"/>`;
+  });
+  parts += `<line x1="${PAD_L + zeroBinIdx * slotW}" y1="${PAD_T}" x2="${PAD_L + zeroBinIdx * slotW}" y2="${H - PAD_B}" stroke="var(--grid)" stroke-width="1"/>`;
+  svg.innerHTML = parts;
+
+  svg.querySelectorAll('.hbar-mark').forEach(rect => {
+    const bin = bins[parseInt(rect.dataset.idx, 10)];
+    rect.addEventListener('pointermove', (ev) => {
+      const wrapRect = svg.parentElement.getBoundingClientRect();
+      tooltip.style.display = 'block';
+      tooltip.style.left = (ev.clientX - wrapRect.left + 12) + 'px';
+      tooltip.style.top = (ev.clientY - wrapRect.top - 10) + 'px';
+      tooltip.innerHTML = `<div class="tt-label">${fmtUSD(bin.lo)} a ${fmtUSD(bin.hi)}</div><div class="tt-value">${bin.count} trade${bin.count === 1 ? '' : 's'}</div>`;
+    });
+    rect.addEventListener('pointerleave', () => { tooltip.style.display = 'none'; });
+  });
+}
+
+function renderSparkline(curve) {
+  const svg = document.getElementById('tile-sparkline');
+  svg.innerHTML = '';
+  if (curve.length < 2) return;
+  const W = 200, H = 28, PAD = 2;
+  const values = curve.map(d => d.cumulative_pnl);
+  const min = Math.min(0, ...values), max = Math.max(0, ...values);
+  const range = (max - min) || 1;
+  const x = i => PAD + (i / (curve.length - 1)) * (W - PAD * 2);
+  const y = v => H - PAD - ((v - min) / range) * (H - PAD * 2);
+  const pathD = curve.map((d, i) => `${i === 0 ? 'M' : 'L'} ${x(i)} ${y(d.cumulative_pnl)}`).join(' ');
+  const last = curve[curve.length - 1];
+  const lastGood = last.cumulative_pnl >= 0;
+  svg.innerHTML = `<path d="${pathD}" fill="none" stroke="var(--text-muted)" stroke-width="1.5" stroke-linejoin="round" opacity="0.55"/>
+    <circle cx="${x(curve.length-1)}" cy="${y(last.cumulative_pnl)}" r="2.5" fill="${lastGood ? 'var(--good)' : 'var(--critical)'}"/>`;
 }
 
 function renderTrades(closed) {
@@ -325,9 +525,12 @@ async function refresh() {
     }
 
     renderRegions(regions.regions);
+    renderRegionCharts(regions.regions);
     renderPositions(status.open_positions);
     renderTrades(trades.closed_trades);
     renderChart(trades.equity_curve);
+    renderPnlHistogram(trades.closed_trades);
+    renderSparkline(trades.equity_curve);
     renderActivity(activity.lines);
 
     document.getElementById('updated').textContent = 'Actualizado ' + new Date().toLocaleTimeString();
