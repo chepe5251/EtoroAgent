@@ -25,6 +25,7 @@ from src.backtest.data import (
     _normalise_candle,
     fetch_symbol,
     load_dataframe,
+    refresh_symbol,
     save_candles,
     _detect_gaps,
 )
@@ -252,6 +253,63 @@ def test_fetch_symbol_warns_if_too_few_bars(mock_client, tmp_path, caplog):
     assert any("only" in msg.lower() and "bars" in msg.lower() for msg in caplog.messages), (
         f"Expected a 'too few bars' warning, got: {caplog.messages}"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# refresh_symbol — incremental cache update
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_refresh_symbol_falls_back_to_full_fetch_without_cache(mock_client, tmp_path):
+    """No cache yet -> refresh_symbol behaves like a full fetch_symbol call."""
+    raw = _make_raw_candles(300)
+    mock_client.get_candles.return_value = raw
+
+    with patch("src.backtest.data._CACHE_DIR", tmp_path):
+        result = run_async(refresh_symbol("AAPL", mock_client))
+
+    mock_client.get_candles.assert_called_once()
+    assert len(result) == 300
+
+
+def test_refresh_symbol_merges_new_bars_without_full_refetch(mock_client, tmp_path):
+    """With a cache that ends a couple of days ago, refresh_symbol requests a
+    small window (not a full 300+ bar re-fetch) and merges the result in."""
+    import datetime as dt
+    two_days_ago = (dt.date.today() - dt.timedelta(days=2)).isoformat()
+    cached_raw = _make_raw_candles(300, "2020-01-01")
+    # Shift the last bar's date to be recent, so the gap is small.
+    cached = [c for c in (_normalise_candle(c) for c in cached_raw) if c]
+    cached[-1]["date"] = two_days_ago
+
+    # The "incremental" response: a handful of new, more recent bars.
+    new_raw = _make_raw_candles(3, two_days_ago)
+    mock_client.get_candles.return_value = new_raw
+
+    with patch("src.backtest.data._CACHE_DIR", tmp_path):
+        save_candles("MSFT", cached)
+        result = run_async(refresh_symbol("MSFT", mock_client))
+
+    # Only a small request should have been made (not a 300+ bar re-fetch).
+    call_kwargs = mock_client.get_candles.call_args
+    assert call_kwargs.kwargs.get("count", 9999) < 300
+
+    dates = [c["date"] for c in result]
+    assert len(dates) == len(set(dates)), "Duplicate dates found after merge"
+    assert dates == sorted(dates), "Dates not in ascending order"
+    assert len(result) > len(cached), "Expected new bars to be appended"
+
+
+def test_refresh_symbol_no_new_data_keeps_cache_unchanged(mock_client, tmp_path):
+    """If the refresh call returns nothing new, the existing cache is returned as-is."""
+    cached_raw = _make_raw_candles(300, "2020-01-01")
+    cached = [c for c in (_normalise_candle(c) for c in cached_raw) if c]
+    mock_client.get_candles.return_value = []
+
+    with patch("src.backtest.data._CACHE_DIR", tmp_path):
+        save_candles("GOOG", cached)
+        result = run_async(refresh_symbol("GOOG", mock_client))
+
+    assert len(result) == len(cached)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

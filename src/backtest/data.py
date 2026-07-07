@@ -40,6 +40,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -232,6 +233,70 @@ async def fetch_symbol(
 
     save_candles(symbol, candles, interval)
     return candles
+
+
+async def refresh_symbol(
+    symbol: str,
+    client: "EtoroClient",
+    interval: str = "D1",
+) -> list[dict]:
+    """
+    Incrementally update an existing cache instead of re-downloading the
+    full (up to 1000-bar) window: fetch only the bars since the last
+    cached date, merge them in, and re-save.
+
+    Falls back to a full fetch_symbol() call when no cache exists yet.
+    Cheap to call often (e.g. once a day to keep hundreds/thousands of
+    symbols current) since each refresh request asks for only a handful
+    of bars rather than the whole history.
+    """
+    cached = load_cached_candles(symbol, interval)
+    if not cached:
+        return await fetch_symbol(symbol, client, interval=interval)
+
+    bars_per_day = _BARS_PER_DAY.get(interval, 1)
+    last_date_str = max(c["date"] for c in cached)
+    last_dt = datetime.fromisoformat(last_date_str.replace("Z", "+00:00"))
+    if last_dt.tzinfo is None:
+        last_dt = last_dt.replace(tzinfo=timezone.utc)
+    gap_days = max((datetime.now(timezone.utc) - last_dt).days, 0)
+    # +2 days of slack (weekends/holidays already covered, plus a safety margin)
+    # and a floor of 5 bars so a same-day refresh still checks for a revised close.
+    count = max((gap_days + 2) * bars_per_day, 5)
+
+    raw = await _fetch_page(symbol, client, count=min(count, _PAGE_LIMIT), interval=interval, direction="desc")
+    new_candles = [_normalise_candle(c) for c in raw]
+    new_candles = [c for c in new_candles if c is not None]
+
+    if not new_candles:
+        logger.info("%s: refresh fetched 0 new candles — cache unchanged (%d bars)", symbol, len(cached))
+        return cached
+
+    merged = {c["date"]: c for c in cached}
+    for c in new_candles:
+        merged[c["date"]] = c   # freshly-fetched value wins on overlap
+    result = _dedup_and_sort(list(merged.values()))
+
+    save_candles(symbol, result, interval)
+    logger.info(
+        "%s: refreshed — %d cached -> %d after merge (+%d new/updated bars)",
+        symbol, len(cached), len(result), len(new_candles),
+    )
+    return result
+
+
+async def refresh_all(
+    symbols: list[str],
+    client: "EtoroClient",
+    inter_request_delay: float = 0.5,
+    interval: str = "D1",
+) -> dict[str, list[dict]]:
+    """Incrementally refresh a list of symbols. Returns {symbol: candles}."""
+    results: dict[str, list[dict]] = {}
+    for symbol in symbols:
+        results[symbol] = await refresh_symbol(symbol, client, interval=interval)
+        await asyncio.sleep(inter_request_delay)
+    return results
 
 
 def _dedup_and_sort(candles: list[dict]) -> list[dict]:

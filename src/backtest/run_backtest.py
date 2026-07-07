@@ -53,9 +53,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--symbols", nargs="+", default=_DEFAULT_SYMBOLS,
                    help="Symbols to backtest")
     p.add_argument("--fetch", action="store_true",
-                   help="Re-download candles (needs ETORO credentials)")
+                   help="Download candles if not already cached (needs ETORO credentials)")
     p.add_argument("--force-fetch", action="store_true",
-                   help="Force re-download even if cache exists")
+                   help="Force a full re-download even if cache exists")
+    p.add_argument("--refresh", action="store_true",
+                   help="Incrementally update cached candles — fetch only the bars "
+                        "since each symbol's last cached date and merge them in, "
+                        "instead of re-downloading the whole (up to 1000-bar) window. "
+                        "Falls back to a full fetch for symbols with no cache yet.")
     p.add_argument("--years", type=int, default=5,
                    help="Years of history to fetch (default 5)")
     p.add_argument("--interval", choices=["D1", "H4", "H1"], default="D1",
@@ -119,8 +124,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 async def _maybe_fetch(symbols: list[str], args: argparse.Namespace) -> None:
-    """Download candles if --fetch or --force-fetch is set."""
-    if not (args.fetch or args.force_fetch):
+    """Download or refresh candles if --fetch, --force-fetch, or --refresh is set."""
+    if not (args.fetch or args.force_fetch or args.refresh):
         return
 
     try:
@@ -134,13 +139,17 @@ async def _maybe_fetch(symbols: list[str], args: argparse.Namespace) -> None:
         sys.exit(1)
 
     async with EtoroClient() as client:
-        logger.info("Fetching %s candles for: %s", args.interval, symbols)
-        await bt_data.fetch_all(
-            symbols, client,
-            years=args.years,
-            force=args.force_fetch,
-            interval=args.interval,
-        )
+        if args.refresh:
+            logger.info("Incrementally refreshing %s candles for: %s", args.interval, symbols)
+            await bt_data.refresh_all(symbols, client, interval=args.interval)
+        else:
+            logger.info("Fetching %s candles for: %s", args.interval, symbols)
+            await bt_data.fetch_all(
+                symbols, client,
+                years=args.years,
+                force=args.force_fetch,
+                interval=args.interval,
+            )
 
 
 def _print_symbol_report(
