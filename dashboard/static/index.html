@@ -118,6 +118,11 @@
   </div>
 
   <div class="card">
+    <h2>Por región</h2>
+    <div id="regions-table"></div>
+  </div>
+
+  <div class="card">
     <h2>Posiciones abiertas</h2>
     <div id="positions-table"></div>
   </div>
@@ -170,6 +175,38 @@ function renderPositions(positions) {
     </tr>`).join('');
   el.innerHTML = `<table><thead><tr>
     <th>Símbolo</th><th>Dirección</th><th>Monto</th><th>Entrada</th><th>Actual</th><th>P&L no realizado</th><th>Antigüedad</th>
+  </tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function fmtWhen(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  const now = new Date();
+  const diffMin = Math.round((d - now) / 60000);
+  if (diffMin < 60) return `en ${diffMin}m`;
+  if (diffMin < 60 * 24) return `en ${(diffMin / 60).toFixed(1)}h`;
+  return d.toLocaleString();
+}
+
+function renderRegions(regions) {
+  const el = document.getElementById('regions-table');
+  if (!regions.length) {
+    el.innerHTML = '<div class="empty">Sin regiones configuradas</div>';
+    return;
+  }
+  let rows = regions.map(r => `
+    <tr>
+      <td>${escapeText(r.region)}</td>
+      <td>${r.symbol_count}</td>
+      <td>${r.open_positions}</td>
+      <td>${r.closed_trades}</td>
+      <td>${r.win_rate == null ? '—' : fmtPct(r.win_rate)}</td>
+      <td class="${r.total_pnl >= 0 ? 'pnl-pos' : 'pnl-neg'}">${fmtUSD(r.total_pnl)}</td>
+      <td>${fmtWhen(r.next_scan)}</td>
+      <td>${fmtWhen(r.next_execute)}</td>
+    </tr>`).join('');
+  el.innerHTML = `<table><thead><tr>
+    <th>Región</th><th>Símbolos</th><th>Abiertas</th><th>Cerrados</th><th>Win rate</th><th>P&L</th><th>Próx. scan</th><th>Próx. ejecución</th>
   </tr></thead><tbody>${rows}</tbody></table>`;
 }
 
@@ -261,8 +298,8 @@ function renderActivity(lines) {
 
 async function refresh() {
   try {
-    const [status, trades, activity] = await Promise.all([
-      fetchJSON('/api/status'), fetchJSON('/api/trades'), fetchJSON('/api/activity')
+    const [status, trades, activity, regions] = await Promise.all([
+      fetchJSON('/api/status'), fetchJSON('/api/trades'), fetchJSON('/api/activity'), fetchJSON('/api/regions')
     ]);
 
     document.getElementById('mode-badge').textContent = status.mode;
@@ -287,6 +324,7 @@ async function refresh() {
       riskCard.style.display = 'none';
     }
 
+    renderRegions(regions.regions);
     renderPositions(status.open_positions);
     renderTrades(trades.closed_trades);
     renderChart(trades.equity_curve);
