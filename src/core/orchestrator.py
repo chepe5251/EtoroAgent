@@ -22,6 +22,8 @@ fills happen as close to the opening price as possible:
           label (BABA, JD, TSM, TM, SONY...), every one of them a US-listed ADR
           trading NYSE/NASDAQ hours, not an Asian exchange (confirmed via real
           hourly volume — see market_calendar.py)
+  HONGKONG: scan 09:15, execute 09:30 Asia/Hong_Kong — genuine HKEX listings
+          (Tencent, HSBC, AIA...), unlike "ASIA" these really do trade HKEX hours
   CRYPTO: scan+execute together, every 6 hours UTC (no market open concept)
 
 Daily:
@@ -133,6 +135,8 @@ class Orchestrator:
                           execute=dict(hour=9, minute=0, timezone="Europe/Berlin")),
             "ASIA": dict(scan=dict(hour=9, minute=15, timezone="America/New_York"),
                           execute=dict(hour=9, minute=30, timezone="America/New_York")),
+            "HONGKONG": dict(scan=dict(hour=9, minute=15, timezone="Asia/Hong_Kong"),
+                              execute=dict(hour=9, minute=30, timezone="Asia/Hong_Kong")),
         }
         for region in _REGIONS:
             if region == "CRYPTO":

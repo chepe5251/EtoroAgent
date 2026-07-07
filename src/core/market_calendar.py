@@ -58,6 +58,15 @@ _REGION_CONFIGS: dict[str, dict] = {
         "open_h": 9, "open_m": 30,
         "close_h": 16, "close_m": 0,
     },
+    "HONGKONG": {
+        # Genuine Hong Kong Stock Exchange listings (Tencent, HSBC, AIA, HKEX
+        # itself, etc.) — unlike "ASIA", these actually trade HKEX hours.
+        "calendar": "XHKG",
+        "fallback": ["HKEX"],
+        "tz": "Asia/Hong_Kong",
+        "open_h": 9, "open_m": 30,
+        "close_h": 16, "close_m": 0,
+    },
     "CRYPTO": {
         "calendar": None,
         "fallback": [],

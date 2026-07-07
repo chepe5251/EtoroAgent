@@ -16,7 +16,13 @@ exit on trend break (close < EMA50), stop-loss, or a 20-day hard time limit.
 `src/backtest/engine.py` and `src/backtest/run_backtest.py`).
 
 **Trading horizon:** 5–20 days (daily candles).
-**Universe:** US/EU/ASIA stocks — large-caps, mid-caps, and momentum names.
+**Universe:** ~840 symbols across US (NYSE/NASDAQ), EU (LSE + Euronext/XETRA),
+"ASIA" (US-listed Asian ADRs — see note below), and HONGKONG (genuine HKEX
+listings) — large-caps, mid-caps, and momentum names, backtest-validated at
+503 real symbols (OOS profit factor 1.80 across NYSE/NASDAQ/LSE/HKEX combined).
+Real Tokyo Stock Exchange listings were investigated but excluded for now:
+eToro only added them in Q1 2026, so there isn't yet enough price history
+(~67 daily bars) to backtest a 5-20 day swing strategy on them.
 Crypto is excluded: eToro's fee structure (1% spread/side + weekend-tripled
 overnight carry) made it unprofitable in backtesting regardless of leverage.
 
@@ -234,6 +240,8 @@ Note: "ASIA" is a symbol-list label, not a trading venue — every symbol in it
 (BABA, JD, TSM, TM, SONY, MUFG, INFY...) is a US-listed ADR, confirmed to trade
 NYSE/NASDAQ hours via real hourly volume (peaks 13:00-20:00 UTC, near-zero
 around Tokyo's actual 00:00 UTC open). It runs on the US schedule/calendar.
+"HONGKONG" is different — those are genuine HKEX listings (Tencent, HSBC,
+AIA, HKEX itself...), so it runs on real Hong Kong market hours/calendar.
 
 | Job | When |
 |---|---|
@@ -243,6 +251,8 @@ around Tokyo's actual 00:00 UTC open). It runs on the US schedule/calendar.
 | EU execute | 09:00 Europe/Berlin (market open) |
 | ASIA scan | 09:15 America/New_York |
 | ASIA execute | 09:30 America/New_York (market open) |
+| HONGKONG scan | 09:15 Asia/Hong_Kong |
+| HONGKONG execute | 09:30 Asia/Hong_Kong (market open) |
 | Position review | 07:00 UTC daily |
 | Trailing stop adjustment | Every 60 minutes |
 | Daily P&L summary (Telegram) | 23:00 UTC |
