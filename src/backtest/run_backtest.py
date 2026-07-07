@@ -103,6 +103,13 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Cap a single position's notional as %% of equity, before leverage (default 10.0)")
     p.add_argument("--atr-stop-multiple", type=float, default=1.5,
                    help="Stop-loss distance as a multiple of ATR (default 1.5)")
+    p.add_argument("--max-positions", type=int, default=3,
+                   help="Max simultaneous open positions (default 3; use a large number for 'unlimited')")
+    p.add_argument("--min-bars", type=int, default=None,
+                   help="Override the minimum cached bars required to include a symbol "
+                        "(default 250). Use a lower value to include symbols with short "
+                        "history (e.g. recently-added exchanges) — results for those "
+                        "symbols may have little/no warmup room and few or no trades.")
     p.add_argument("--equity", type=float, default=10_000.0,
                    help="Starting equity in USD (default 10000)")
     p.add_argument("--leverage", type=float, default=1.0,
@@ -228,7 +235,11 @@ def main() -> None:
         max_hold_days=max_hold_days,
         max_notional_pct=args.max_notional_pct,
         atr_stop_multiple=args.atr_stop_multiple,
+        max_positions=args.max_positions,
     )
+
+    if args.min_bars is not None:
+        bt_data._MIN_BARS_FOR_BACKTEST = args.min_bars
 
     print(f"\n{'#' * 56}")
     print(f"  etoroBot Backtester")

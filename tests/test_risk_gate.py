@@ -147,7 +147,7 @@ def test_risk_blocked_state_rejected():
 def test_max_positions_reached_rejected():
     positions = [
         Position(f"p{i}", f"i{i}", f"SYM{i}", True, 200, 100, 2.0, _now())
-        for i in range(3)  # MAX_OPEN_POSITIONS = 3
+        for i in range(risk_gate._MAX_OPEN_POSITIONS)
     ]
     state = _make_state(open_positions=positions)
     thesis = _make_thesis(symbol="BTC")
