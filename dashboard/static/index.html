@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>etoroAgent — Dashboard</title>
+<style>
+  :root {
+    --surface-1:      #fcfcfb;
+    --page:           #f9f9f7;
+    --text-primary:   #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted:     #898781;
+    --grid:           #e1e0d9;
+    --baseline:       #c3c2b7;
+    --border:         rgba(11,11,11,0.10);
+    --series-1:       #2a78d6; /* blue */
+    --series-1-wash:  rgba(42,120,214,0.10);
+    --good:           #0ca30c;
+    --critical:       #d03b3b;
+    --warning:        #fab219;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --surface-1:      #1a1a19;
+      --page:           #0d0d0d;
+      --text-primary:   #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted:     #898781;
+      --grid:           #2c2c2a;
+      --baseline:       #383835;
+      --border:         rgba(255,255,255,0.10);
+      --series-1:       #3987e5;
+      --series-1-wash:  rgba(57,135,229,0.14);
+      --good:           #0ca30c;
+      --critical:       #d03b3b;
+      --warning:        #fab219;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--page);
+    color: var(--text-primary);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-size: 14px;
+    padding: 24px;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; }
+  header {
+    display: flex; align-items: center; gap: 12px; margin-bottom: 20px; flex-wrap: wrap;
+  }
+  h1 { font-size: 18px; font-weight: 600; margin: 0; }
+  .badge {
+    font-size: 12px; font-weight: 600; padding: 3px 9px; border-radius: 999px;
+    background: var(--series-1-wash); color: var(--series-1);
+  }
+  .spacer { flex: 1; }
+  #updated { color: var(--text-muted); font-size: 12px; }
+  .card {
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px;
+    padding: 16px; margin-bottom: 16px;
+  }
+  .card h2 {
+    font-size: 13px; font-weight: 600; color: var(--text-secondary);
+    margin: 0 0 12px 0; text-transform: uppercase; letter-spacing: 0.02em;
+  }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .tile { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+  .tile .label { color: var(--text-secondary); font-size: 12px; margin-bottom: 6px; }
+  .tile .value { font-size: 26px; font-weight: 600; }
+  .tile .delta { font-size: 12px; margin-top: 4px; font-weight: 600; }
+  .delta.good { color: var(--good); }
+  .delta.bad { color: var(--critical); }
+  table { width: 100%; border-collapse: collapse; }
+  th, td {
+    text-align: left; padding: 8px 10px; font-size: 13px; border-bottom: 1px solid var(--grid);
+    font-variant-numeric: tabular-nums;
+  }
+  th { color: var(--text-muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.02em; }
+  tr:last-child td { border-bottom: none; }
+  .dir-buy { color: var(--good); font-weight: 600; }
+  .dir-sell { color: var(--critical); font-weight: 600; }
+  .pnl-pos { color: var(--good); }
+  .pnl-neg { color: var(--critical); }
+  .empty { color: var(--text-muted); font-size: 13px; padding: 24px 0; text-align: center; }
+  #chart-wrap { position: relative; }
+  #chart-tooltip {
+    position: absolute; pointer-events: none; background: var(--surface-1);
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
+    font-size: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.12); display: none; white-space: nowrap;
+  }
+  #chart-tooltip .tt-value { font-weight: 700; color: var(--text-primary); }
+  #chart-tooltip .tt-label { color: var(--text-secondary); }
+  .activity-feed { max-height: 260px; overflow-y: auto; font-family: ui-monospace, monospace; font-size: 12px; color: var(--text-secondary); line-height: 1.6; }
+  .risk-block { color: var(--critical); font-weight: 600; margin-bottom: 8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>etoroAgent</h1>
+    <span class="badge" id="mode-badge">—</span>
+    <div class="spacer"></div>
+    <span id="updated">cargando…</span>
+  </header>
+
+  <div class="tiles">
+    <div class="tile"><div class="label">Balance</div><div class="value" id="tile-balance">—</div></div>
+    <div class="tile"><div class="label">P&amp;L del día</div><div class="value" id="tile-daily-pnl">—</div></div>
+    <div class="tile"><div class="label">Posiciones abiertas</div><div class="value" id="tile-positions">—</div></div>
+    <div class="tile"><div class="label">Win rate</div><div class="value" id="tile-winrate">—</div><div class="delta" id="tile-winrate-sub"></div></div>
+    <div class="tile"><div class="label">P&amp;L total realizado</div><div class="value" id="tile-total-pnl">—</div></div>
+  </div>
+
+  <div class="card" id="risk-card" style="display:none">
+    <div class="risk-block" id="risk-reason"></div>
+  </div>
+
+  <div class="card">
+    <h2>Posiciones abiertas</h2>
+    <div id="positions-table"></div>
+  </div>
+
+  <div class="card">
+    <h2>Curva de P&amp;L realizado (acumulado)</h2>
+    <div id="chart-wrap">
+      <svg id="equity-chart" width="100%" height="220" viewBox="0 0 800 220" preserveAspectRatio="none"></svg>
+      <div id="chart-tooltip"></div>
+    </div>
+  </div>
+
+    <div class="card">
+      <h2>Trades cerrados recientes <a href="/api/trades.csv" style="float:right;font-size:12px;font-weight:400;color:var(--series-1);text-decoration:none;border:1px solid var(--series-1);border-radius:6px;padding:3px 10px;">⬇ Descargar trades.csv</a></h2>
+      <div id="trades-table"></div>
+    </div>
+
+  <div class="card">
+    <h2>Actividad reciente</h2>
+    <div class="activity-feed" id="activity-feed"></div>
+  </div>
+</div>
+
+<script>
+const fmtUSD = n => n.toLocaleString('en-US', {style:'currency', currency:'USD', maximumFractionDigits: 2});
+const fmtPct = n => n.toFixed(1) + '%';
+const escapeText = s => { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; };
+
+async function fetchJSON(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(url + ' -> ' + r.status);
+  return r.json();
+}
+
+function renderPositions(positions) {
+  const el = document.getElementById('positions-table');
+  if (!positions.length) {
+    el.innerHTML = '<div class="empty">Sin posiciones abiertas</div>';
+    return;
+  }
+  let rows = positions.map(p => `
+    <tr>
+      <td>${escapeText(p.symbol)}</td>
+      <td class="${p.is_buy ? 'dir-buy' : 'dir-sell'}">${p.is_buy ? 'LONG' : 'SHORT'}</td>
+      <td>${fmtUSD(p.amount_usd)}</td>
+      <td>${p.entry_rate.toFixed(4)}</td>
+      <td>${p.current_rate.toFixed(4)}</td>
+      <td class="${p.unrealized_pnl >= 0 ? 'pnl-pos' : 'pnl-neg'}">${fmtUSD(p.unrealized_pnl)}</td>
+      <td>${p.days_open}d / ${p.horizon_days}d</td>
+    </tr>`).join('');
+  el.innerHTML = `<table><thead><tr>
+    <th>Símbolo</th><th>Dirección</th><th>Monto</th><th>Entrada</th><th>Actual</th><th>P&L no realizado</th><th>Antigüedad</th>
+  </tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function renderTrades(closed) {
+  const el = document.getElementById('trades-table');
+  if (!closed.length) {
+    el.innerHTML = '<div class="empty">Todavía no se cerró ninguna operación</div>';
+    return;
+  }
+  let rows = closed.slice(0, 20).map(t => `
+    <tr>
+      <td>${new Date(t.timestamp).toLocaleString()}</td>
+      <td>${escapeText(t.symbol)}</td>
+      <td class="${t.is_buy ? 'dir-buy' : 'dir-sell'}">${t.is_buy ? 'LONG' : 'SHORT'}</td>
+      <td class="${t.pnl >= 0 ? 'pnl-pos' : 'pnl-neg'}">${fmtUSD(t.pnl)}</td>
+      <td>${t.duration_hours.toFixed(1)}h</td>
+      <td>${escapeText(t.reason || '')}</td>
+    </tr>`).join('');
+  el.innerHTML = `<table><thead><tr>
+    <th>Cierre</th><th>Símbolo</th><th>Dirección</th><th>P&L</th><th>Duración</th><th>Motivo</th>
+  </tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function renderChart(curve) {
+  const svg = document.getElementById('equity-chart');
+  const tooltip = document.getElementById('chart-tooltip');
+  svg.innerHTML = '';
+  if (curve.length < 2) {
+    svg.parentElement.insertAdjacentHTML('beforeend', '');
+    const w = svg.getBoundingClientRect().width || 800;
+    svg.innerHTML = `<text x="${w/2}" y="110" text-anchor="middle" fill="var(--text-muted)" font-size="13">Sin suficientes trades cerrados todavía para graficar</text>`;
+    return;
+  }
+  const W = 800, H = 220, PAD = 30;
+  const values = curve.map(d => d.cumulative_pnl);
+  const min = Math.min(0, ...values), max = Math.max(0, ...values);
+  const range = (max - min) || 1;
+  const x = i => PAD + (i / (curve.length - 1)) * (W - PAD * 2);
+  const y = v => H - PAD - ((v - min) / range) * (H - PAD * 2);
+
+  // gridline at zero
+  const zeroY = y(0);
+  let svgParts = `<line x1="${PAD}" y1="${zeroY}" x2="${W-PAD}" y2="${zeroY}" stroke="var(--baseline)" stroke-width="1"/>`;
+
+  const pathD = curve.map((d, i) => `${i === 0 ? 'M' : 'L'} ${x(i)} ${y(d.cumulative_pnl)}`).join(' ');
+  const areaD = pathD + ` L ${x(curve.length-1)} ${zeroY} L ${x(0)} ${zeroY} Z`;
+
+  svgParts += `<path d="${areaD}" fill="var(--series-1-wash)" stroke="none"/>`;
+  svgParts += `<path d="${pathD}" fill="none" stroke="var(--series-1)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+
+  const last = curve[curve.length - 1];
+  svgParts += `<circle cx="${x(curve.length-1)}" cy="${y(last.cumulative_pnl)}" r="4" fill="var(--series-1)" stroke="var(--surface-1)" stroke-width="2"/>`;
+
+  svg.innerHTML = svgParts;
+
+  // crosshair + tooltip
+  let cross = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+  cross.setAttribute('y1', PAD); cross.setAttribute('y2', H - PAD);
+  cross.setAttribute('stroke', 'var(--baseline)'); cross.setAttribute('stroke-width', '1');
+  cross.style.display = 'none';
+  svg.appendChild(cross);
+
+  const hit = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+  hit.setAttribute('x', 0); hit.setAttribute('y', 0); hit.setAttribute('width', W); hit.setAttribute('height', H);
+  hit.setAttribute('fill', 'transparent');
+  svg.appendChild(hit);
+
+  hit.addEventListener('pointermove', (ev) => {
+    const rect = svg.getBoundingClientRect();
+    const px = (ev.clientX - rect.left) / rect.width * W;
+    let idx = Math.round((px - PAD) / (W - PAD * 2) * (curve.length - 1));
+    idx = Math.max(0, Math.min(curve.length - 1, idx));
+    const d = curve[idx];
+    cross.setAttribute('x1', x(idx)); cross.setAttribute('x2', x(idx));
+    cross.style.display = 'block';
+    tooltip.style.display = 'block';
+    tooltip.style.left = (ev.clientX - rect.left + 12) + 'px';
+    tooltip.style.top = (ev.clientY - rect.top - 10) + 'px';
+    tooltip.innerHTML = `<div class="tt-label">${new Date(d.timestamp).toLocaleString()}</div><div class="tt-value">${fmtUSD(d.cumulative_pnl)}</div>`;
+  });
+  hit.addEventListener('pointerleave', () => { cross.style.display = 'none'; tooltip.style.display = 'none'; });
+}
+
+function renderActivity(lines) {
+  const el = document.getElementById('activity-feed');
+  if (!lines.length) { el.innerHTML = '<div class="empty">Sin actividad reciente</div>'; return; }
+  el.innerHTML = lines.slice().reverse().map(l => `<div>${escapeText(l)}</div>`).join('');
+}
+
+async function refresh() {
+  try {
+    const [status, trades, activity] = await Promise.all([
+      fetchJSON('/api/status'), fetchJSON('/api/trades'), fetchJSON('/api/activity')
+    ]);
+
+    document.getElementById('mode-badge').textContent = status.mode;
+    document.getElementById('tile-balance').textContent = status.balance_error ? '—' : fmtUSD(status.balance);
+    const dp = status.daily_pnl;
+    const dpEl = document.getElementById('tile-daily-pnl');
+    dpEl.textContent = fmtUSD(dp);
+    dpEl.style.color = dp >= 0 ? 'var(--good)' : 'var(--critical)';
+    document.getElementById('tile-positions').textContent = status.open_positions.length;
+    document.getElementById('tile-winrate').textContent = trades.win_rate == null ? '—' : fmtPct(trades.win_rate);
+    document.getElementById('tile-winrate-sub').textContent = trades.closed_count ? `${trades.win_count}/${trades.closed_count} trades` : '';
+    const tp = trades.total_realized_pnl;
+    const tpEl = document.getElementById('tile-total-pnl');
+    tpEl.textContent = tp == null ? '—' : fmtUSD(tp);
+    tpEl.style.color = tp >= 0 ? 'var(--good)' : 'var(--critical)';
+
+    const riskCard = document.getElementById('risk-card');
+    if (status.is_risk_blocked) {
+      riskCard.style.display = 'block';
+      document.getElementById('risk-reason').textContent = 'Bloqueado por risk gate: ' + status.risk_block_reason;
+    } else {
+      riskCard.style.display = 'none';
+    }
+
+    renderPositions(status.open_positions);
+    renderTrades(trades.closed_trades);
+    renderChart(trades.equity_curve);
+    renderActivity(activity.lines);
+
+    document.getElementById('updated').textContent = 'Actualizado ' + new Date().toLocaleTimeString();
+  } catch (e) {
+    document.getElementById('updated').textContent = 'Error actualizando: ' + e.message;
+  }
+}
+
+refresh();
+setInterval(refresh, 15000);
+</script>
+</body>
+</html>

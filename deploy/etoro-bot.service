@@ -1,0 +1,16 @@
+[Unit]
+Description=etoroAgent - autonomous swing-trading bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/etoroBot
+ExecStart=%h/etoroBot/.venv/bin/python %h/etoroBot/main.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
