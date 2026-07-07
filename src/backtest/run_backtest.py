@@ -99,6 +99,10 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Disable EMA crossover entries (compare variant)")
     p.add_argument("--risk-pct", type=float, default=1.0,
                    help="Risk %% per trade of equity (default 1.0)")
+    p.add_argument("--max-notional-pct", type=float, default=10.0,
+                   help="Cap a single position's notional as %% of equity, before leverage (default 10.0)")
+    p.add_argument("--atr-stop-multiple", type=float, default=1.5,
+                   help="Stop-loss distance as a multiple of ATR (default 1.5)")
     p.add_argument("--equity", type=float, default=10_000.0,
                    help="Starting equity in USD (default 10000)")
     p.add_argument("--leverage", type=float, default=1.0,
@@ -222,6 +226,8 @@ def main() -> None:
         exit_mode=args.exit,
         leverage=args.leverage,
         max_hold_days=max_hold_days,
+        max_notional_pct=args.max_notional_pct,
+        atr_stop_multiple=args.atr_stop_multiple,
     )
 
     print(f"\n{'#' * 56}")

@@ -97,7 +97,7 @@ class BacktestConfig:
     exit_mode: str = "mean_reversion"    # "mean_reversion" | "trailing"
     tp_rsi_level: float = 55.0           # for mean_reversion: exit when RSI >= this
     trail_atr_multiple: float = 1.5      # for trailing: trail by N×ATR
-    max_hold_days: int = 20              # hard time limit
+    max_hold_days: int = 0               # hard time limit in bars; 0 = disabled (no forced exit)
 
     # ── Per-asset-class costs (A3) ────────────────────────────────────────────
     # Equity (eToro stocks / ETFs)
@@ -534,7 +534,7 @@ def run(
                     exit_reason = "trail_stop"
 
             # 3. Time limit → fill at next bar's open
-            if exit_price is None and (i - pos.entry_bar) >= cfg.max_hold_days:
+            if exit_price is None and cfg.max_hold_days > 0 and (i - pos.entry_bar) >= cfg.max_hold_days:
                 if i + 1 < n:
                     exit_price = df_ind.iloc[i + 1]["open"] * (1.0 - pos_cost)
                 else:
