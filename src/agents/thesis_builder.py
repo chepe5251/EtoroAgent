@@ -14,7 +14,10 @@ from src.core.thesis import TradingThesis
 
 _CONFIDENCE = 0.75             # fixed — this is a rule-based system, not an LLM opinion
 _HORIZON_DAYS = 15             # within [SWING_MIN_HORIZON_DAYS, SWING_MAX_HORIZON_DAYS]
-_STOP_LOSS_ATR_MULTIPLE = 3.5  # matches BacktestConfig.atr_stop_multiple (validated on 2704-symbol universe: OOS PF 2.04, P&L $5,424.27 at 3x leverage/5% risk — best absolute return found)
+_STOP_LOSS_ATR_MULTIPLE = 2.5  # matches PortfolioConfig.atr_stop_multiple (validated with the
+                               # portfolio-level backtest engine — shared equity, 3 max positions,
+                               # 2-per-sector cap, conviction priority queueing: OOS PF 2.77,
+                               # P&L $2,291.20 on $800, drawdown 38.38%, consistent IS->OOS)
 
 
 def build_thesis(result: ScreeningResult) -> TradingThesis:

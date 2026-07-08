@@ -2,7 +2,15 @@
 PositionReviewAgent — daily review of open swing positions. No LLM.
 
 For each open position it:
-  1. Enforces the 20-day hard exit (deterministic).
+  1. Enforces the hard exit, measured in trading-day BARS held — matching
+     src/backtest/engine.py's max_hold_days convention exactly (20 bars =
+     20 trading days ≈ 28 calendar days). Bars held is computed by counting
+     the symbol's own daily candles dated after the position was opened,
+     using the same candle fetch the trend-break check already needs — so
+     this self-corrects across restarts/missed cycles rather than relying
+     on a persisted counter that could drift out of sync.
+     (Previously this counted raw calendar days via Position.days_open —
+     ~14 trading days, a real divergence from the backtest that's now fixed.)
   2. Checks the same trend_break exit condition validated in the backtest
      (src/backtest/engine.py, exit_mode="trend_break"): if the daily close
      is below EMA50, the trend that justified the trade is gone — exit.
@@ -12,6 +20,7 @@ For each open position it:
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from src.core.state import Position, ProjectState, get_hard_exit_days
@@ -25,6 +34,29 @@ logger = logging.getLogger(__name__)
 
 _EMA_PERIOD = 50
 _CANDLE_COUNT = 60
+
+
+def _parse_candle_date(raw: dict) -> datetime | None:
+    date_str = raw.get("fromDate") or raw.get("date")
+    if not date_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(date_str).replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _bars_held(candles: list[dict], opened_at: datetime) -> int:
+    """Count candles dated strictly after `opened_at` — the number of
+    trading-day bars this position has been held, matching engine.py's
+    bar-count time-limit convention (not raw calendar days)."""
+    count = 0
+    for c in candles:
+        dt = _parse_candle_date(c)
+        if dt is not None and dt > opened_at:
+            count += 1
+    return count
 
 
 class PositionReviewAgent:
@@ -56,22 +88,34 @@ class PositionReviewAgent:
                 await self.notification_agent.send_critical_error(f"Error reviewing position {pos.symbol}: {exc}")
 
     async def _review_position(self, pos: Position):
+        try:
+            candles = await self.execution_agent.client.get_candles(
+                pos.symbol, interval="D1", count=_CANDLE_COUNT
+            )
+        except Exception as exc:
+            logger.warning("PositionReview: candle fetch failed for %s: %s", pos.symbol, exc)
+            return
+
+        bars_held = _bars_held(candles, pos.opened_at)
+        hard_exit_bars = get_hard_exit_days()
         logger.info(
-            "PositionReview: %s — day %d/%d (horizon=%d)",
-            pos.symbol, pos.days_open, get_hard_exit_days(), pos.horizon_days,
+            "PositionReview: %s — bar %d/%d held (horizon=%d)",
+            pos.symbol, bars_held, hard_exit_bars, pos.horizon_days,
         )
 
-        # ── Hard exit: 20-day absolute limit (deterministic) ──────────────
-        if pos.is_past_hard_exit:
+        # ── Hard exit: absolute bar-count limit (deterministic) ───────────
+        # Matches src/backtest/engine.py's max_hold_days: BARS held, not
+        # calendar days (20 bars ≈ 28 calendar days, not 20 calendar days).
+        if bars_held >= hard_exit_bars:
             logger.warning(
-                "PositionReview: %s hit 20-day hard limit — forcing EXIT", pos.symbol
+                "PositionReview: %s hit %d-bar hard limit — forcing EXIT", pos.symbol, hard_exit_bars
             )
-            await self._close(pos, reason=f"20-day hard exit limit reached (opened {pos.days_open}d ago)")
+            await self._close(pos, reason=f"{hard_exit_bars}-bar hard exit limit reached ({bars_held} bars held)")
             return
 
         # ── Trend-break exit: close < EMA50 (deterministic) ────────────────
         # Same condition validated in the backtest's exit_mode="trend_break".
-        verdict = await self._technical_review(pos)
+        verdict = self._technical_review(candles)
         if verdict is None:
             logger.warning("PositionReview: %s — no price data, skipping", pos.symbol)
             return
@@ -85,16 +129,8 @@ class PositionReviewAgent:
         else:
             logger.info("PositionReview: %s → HOLD, no action", pos.symbol)
 
-    async def _technical_review(self, pos: Position) -> dict | None:
+    def _technical_review(self, candles: list[dict]) -> dict | None:
         """Deterministic trend-break check: exit if close < EMA50."""
-        try:
-            candles = await self.execution_agent.client.get_candles(
-                pos.symbol, interval="D1", count=_CANDLE_COUNT
-            )
-        except Exception as exc:
-            logger.warning("PositionReview: candle fetch failed for %s: %s", pos.symbol, exc)
-            return None
-
         closes = [float(c.get("close") or c.get("c") or 0) for c in candles]
         if len(closes) < _EMA_PERIOD:
             return None

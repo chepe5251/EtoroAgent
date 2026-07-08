@@ -80,6 +80,36 @@ async def test_execute_region_consumes_pending_signals():
 
 
 @pytest.mark.asyncio
+async def test_execute_region_prioritizes_highest_conviction_first():
+    """When a region's shortlist has more signals than can be acted on in
+    order, the highest-conviction one (stronger rel_volume/trend) must be
+    processed first — not whichever sorts first in universe order."""
+    state = ProjectState()
+    state.pending_signals["US"] = [
+        {"symbol": "WEAK_SIGNAL", "rsi": None, "ema20": None, "ema50": 101.0, "ema200": 100.0,
+         "atr": None, "rel_volume": 1.6, "trend_up": True, "breakout": True,
+         "pullback_resume": False, "score_tags": ["breakout"]},
+        {"symbol": "STRONG_SIGNAL", "rsi": None, "ema20": None, "ema50": 120.0, "ema200": 100.0,
+         "atr": None, "rel_volume": 5.0, "trend_up": True, "breakout": True,
+         "pullback_resume": False, "score_tags": ["breakout"]},
+    ]
+    orch = _make_orchestrator(state)
+    orch._get_balance = AsyncMock(return_value=1000.0)
+    orch._unrealized_pnl = MagicMock(return_value=0.0)
+    orch._build_and_execute = AsyncMock()
+
+    with patch("src.core.orchestrator.is_trading_day", return_value=True):
+        await orch._execute_region("US")
+
+    assert orch._build_and_execute.call_count == 2
+    first_call_symbol = orch._build_and_execute.call_args_list[0].args[0].symbol
+    assert first_call_symbol == "STRONG_SIGNAL", (
+        "the higher-conviction signal (stronger rel_volume + trend) must be "
+        "processed first, even though it sorts alphabetically after WEAK_SIGNAL"
+    )
+
+
+@pytest.mark.asyncio
 async def test_execute_region_noop_when_nothing_pending():
     state = ProjectState()
     orch = _make_orchestrator(state)

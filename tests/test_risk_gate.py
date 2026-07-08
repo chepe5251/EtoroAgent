@@ -165,6 +165,50 @@ def test_duplicate_symbol_rejected():
     assert "BTC" in reason or "already" in reason
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Rule 7b — sector concentration cap
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_sector_cap_rejects_third_position_in_same_sector():
+    """Two banks already open, MAX_POSITIONS_PER_SECTOR=2 -> a third bank is rejected."""
+    positions = [
+        Position("p1", "i1", "FIRST_NATIONAL_BANK", True, 200, 100, 2.0, _now()),
+        Position("p2", "i2", "UNITED_GLOBAL_BANK", True, 200, 100, 2.0, _now()),
+    ]
+    state = _make_state(open_positions=positions)
+    thesis = _make_thesis(symbol="ATLANTIC_COMMERCE_BANK")
+    approved, reason = risk_gate.validate(thesis, state, balance=10000.0)
+    assert approved is False
+    assert "sector" in reason.lower()
+
+
+def test_sector_cap_allows_different_sector():
+    """A bank and a pharma company are open; a new oil company (different
+    sector from both) must not be blocked by the sector cap."""
+    positions = [
+        Position("p1", "i1", "FIRST_NATIONAL_BANK", True, 200, 100, 2.0, _now()),
+        Position("p2", "i2", "GLOBAL_PHARMA_THERAPEUTICS", True, 200, 100, 2.0, _now()),
+    ]
+    state = _make_state(open_positions=positions)
+    thesis = _make_thesis(symbol="ATLANTIC_OIL_PETROLEUM")
+    approved, reason = risk_gate.validate(thesis, state, balance=10000.0)
+    assert approved is True
+
+
+def test_sector_cap_does_not_restrict_unclassified_symbols():
+    """Two unclassified ("Other") symbols already open must not block a
+    third unrelated unclassified symbol — the cap only applies to sectors
+    we can actually identify."""
+    positions = [
+        Position("p1", "i1", "ZQXVTECH_HOLDINGS_XYZ", True, 200, 100, 2.0, _now()),
+        Position("p2", "i2", "KRONOS_VENTURES_ABC", True, 200, 100, 2.0, _now()),
+    ]
+    state = _make_state(open_positions=positions)
+    thesis = _make_thesis(symbol="OMEGA_DYNAMICS_QRS")
+    approved, reason = risk_gate.validate(thesis, state, balance=10000.0)
+    assert approved is True
+
+
 def test_daily_loss_limit_exceeded_rejected():
     state = _make_state(daily_pnl=-310.0)  # -310 on 10000 = 3.1% > 3%
     thesis = _make_thesis()

@@ -85,6 +85,26 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _conviction_score(result: ScreeningResult) -> float:
+    """
+    Priority-queueing score: when a region's shortlist has more qualifying
+    signals than available position slots, higher-conviction ones should be
+    tried first — not whichever happens to sort first in universe order.
+    Matches src/backtest/portfolio_engine.py's _conviction_score exactly
+    (backtest-validated: this was the single biggest improvement found this
+    session, OOS PF 1.24 -> 1.68 on identical risk/leverage/notional).
+    Combines relative-volume confirmation strength with how extended
+    EMA50 is above EMA200 (trend strength) — thesis_builder.py assigns a
+    fixed confidence to every thesis, so there's no other ranking signal yet.
+    """
+    rel_vol = result.rel_volume if result.rel_volume is not None else 1.0
+    if result.ema50 is not None and result.ema200 is not None and result.ema200 != 0:
+        trend_strength = max((result.ema50 - result.ema200) / result.ema200, 0.0)
+    else:
+        trend_strength = 0.0
+    return rel_vol * (1.0 + trend_strength)
+
+
 class Orchestrator:
     def __init__(self):
         # Load persisted state from disk (positions survive restarts).
@@ -279,6 +299,9 @@ class Orchestrator:
         self.state.save()
 
         shortlist = [ScreeningResult(**d) for d in pending]
+        # Priority queueing: highest-conviction signals get first claim on the
+        # limited position slots (see _conviction_score docstring).
+        shortlist.sort(key=_conviction_score, reverse=True)
         unrealized_pnl = self._unrealized_pnl()
 
         for result in shortlist:
