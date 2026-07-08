@@ -165,6 +165,17 @@ async def test_get_balance(mock_client):
 
 
 @pytest.mark.asyncio
+async def test_get_account_capital_sums_credit_and_margin(mock_client):
+    from unittest.mock import AsyncMock
+    mock_client._get_client_portfolio = AsyncMock(return_value={
+        "credit": 500.0,
+        "positions": [{"amount": 380.45}, {"amount": 14.99}],
+    })
+    capital = await mock_client.get_account_capital()
+    assert capital == pytest.approx(500.0 + 380.45 + 14.99, abs=0.01)
+
+
+@pytest.mark.asyncio
 async def test_get_portfolio(mock_client):
     portfolio = await mock_client.get_portfolio()
     assert portfolio == []
