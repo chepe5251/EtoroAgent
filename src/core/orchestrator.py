@@ -29,6 +29,17 @@ fills happen as close to the opening price as possible:
           instrument IDs from the "ASIA" ADRs). eToro only added these in
           Q1 2026 so daily history is short (~67 bars) — NOT yet backtest-
           validated (needs 250+ bars). Included anyway per explicit request.
+  GERMANY:     scan 08:45, execute 09:00 Europe/Berlin — full Xetra listing
+  FRANCE:      scan 08:45, execute 09:00 Europe/Paris — full Euronext Paris listing
+  SWITZERLAND: scan 08:45, execute 09:00 Europe/Zurich — SIX Swiss Exchange
+  AUSTRALIA:   scan 09:45, execute 10:00 Australia/Sydney — ASX
+  SWEDEN:      scan 08:45, execute 09:00 Europe/Stockholm — Nasdaq Stockholm
+  UK:          scan 07:45, execute 08:00 Europe/London — LSE main board (filtered
+               out of eToro's mixed exchangeID=7 bucket, which also carries
+               legacy Russian ADR listings — excluded by name-blocklist)
+  These 6 regions were discovered via eToro's bulk /market-data/instruments
+  endpoint (returns every instrument with its exchangeID) rather than the
+  earlier fuzzy-name-search approach used for the original US/EU/ASIA universe.
   CRYPTO: scan+execute together, every 6 hours UTC (no market open concept)
 
 Daily:
@@ -144,6 +155,18 @@ class Orchestrator:
                               execute=dict(hour=9, minute=30, timezone="Asia/Hong_Kong")),
             "JAPAN": dict(scan=dict(hour=8, minute=45, timezone="Asia/Tokyo"),
                           execute=dict(hour=9, minute=0, timezone="Asia/Tokyo")),
+            "GERMANY": dict(scan=dict(hour=8, minute=45, timezone="Europe/Berlin"),
+                             execute=dict(hour=9, minute=0, timezone="Europe/Berlin")),
+            "FRANCE": dict(scan=dict(hour=8, minute=45, timezone="Europe/Paris"),
+                            execute=dict(hour=9, minute=0, timezone="Europe/Paris")),
+            "SWITZERLAND": dict(scan=dict(hour=8, minute=45, timezone="Europe/Zurich"),
+                                 execute=dict(hour=9, minute=0, timezone="Europe/Zurich")),
+            "AUSTRALIA": dict(scan=dict(hour=9, minute=45, timezone="Australia/Sydney"),
+                               execute=dict(hour=10, minute=0, timezone="Australia/Sydney")),
+            "SWEDEN": dict(scan=dict(hour=8, minute=45, timezone="Europe/Stockholm"),
+                            execute=dict(hour=9, minute=0, timezone="Europe/Stockholm")),
+            "UK": dict(scan=dict(hour=7, minute=45, timezone="Europe/London"),
+                       execute=dict(hour=8, minute=0, timezone="Europe/London")),
         }
         for region in _REGIONS:
             if region == "CRYPTO":

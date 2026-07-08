@@ -49,6 +49,12 @@ _REGION_SCHEDULES = {
     "ASIA":      dict(scan=(9, 15), execute=(9, 30), tz="America/New_York"),
     "HONGKONG":  dict(scan=(9, 15), execute=(9, 30), tz="Asia/Hong_Kong"),
     "JAPAN":     dict(scan=(8, 45), execute=(9, 0), tz="Asia/Tokyo"),
+    "GERMANY":     dict(scan=(8, 45), execute=(9, 0), tz="Europe/Berlin"),
+    "FRANCE":      dict(scan=(8, 45), execute=(9, 0), tz="Europe/Paris"),
+    "SWITZERLAND": dict(scan=(8, 45), execute=(9, 0), tz="Europe/Zurich"),
+    "AUSTRALIA":   dict(scan=(9, 45), execute=(10, 0), tz="Australia/Sydney"),
+    "SWEDEN":      dict(scan=(8, 45), execute=(9, 0), tz="Europe/Stockholm"),
+    "UK":          dict(scan=(7, 45), execute=(8, 0), tz="Europe/London"),
 }
 
 

@@ -80,6 +80,59 @@ _REGION_CONFIGS: dict[str, dict] = {
         "open_h": 9, "open_m": 0,
         "close_h": 15, "close_m": 0,
     },
+    "GERMANY": {
+        # Full Xetra listing (~570 symbols) — distinct from "EU" (curated
+        # LSE+Euronext+XETRA mix). Discovered via eToro's bulk instruments
+        # endpoint (exchangeID=6).
+        "calendar": "XETR",
+        "fallback": ["XFRA"],
+        "tz": "Europe/Berlin",
+        "open_h": 9, "open_m": 0,
+        "close_h": 17, "close_m": 30,
+    },
+    "FRANCE": {
+        # Full Euronext Paris listing (~515 symbols, exchangeID=9).
+        "calendar": "XPAR",
+        "fallback": [],
+        "tz": "Europe/Paris",
+        "open_h": 9, "open_m": 0,
+        "close_h": 17, "close_m": 30,
+    },
+    "SWITZERLAND": {
+        # SIX Swiss Exchange (~65 symbols, exchangeID=12) — few names but
+        # includes Nestle, Roche, Novartis, ABB.
+        "calendar": "XSWX",
+        "fallback": ["SIX"],
+        "tz": "Europe/Zurich",
+        "open_h": 9, "open_m": 0,
+        "close_h": 17, "close_m": 30,
+    },
+    "AUSTRALIA": {
+        # ASX (~427 symbols, exchangeID=31).
+        "calendar": "XASX",
+        "fallback": ["ASX"],
+        "tz": "Australia/Sydney",
+        "open_h": 10, "open_m": 0,
+        "close_h": 16, "close_m": 0,
+    },
+    "SWEDEN": {
+        # Nasdaq Stockholm (~414 symbols, exchangeID=15).
+        "calendar": "XSTO",
+        "fallback": [],
+        "tz": "Europe/Stockholm",
+        "open_h": 9, "open_m": 0,
+        "close_h": 17, "close_m": 30,
+    },
+    "UK": {
+        # LSE main board (~861 symbols after filtering junk/Russian-name
+        # entries out of eToro's mixed exchangeID=7 bucket, which also
+        # contains legacy Russian ADR listings and some Indian names).
+        "calendar": "XLON",
+        "fallback": ["LSE"],
+        "tz": "Europe/London",
+        "open_h": 8, "open_m": 0,
+        "close_h": 16, "close_m": 30,
+    },
     "CRYPTO": {
         "calendar": None,
         "fallback": [],
