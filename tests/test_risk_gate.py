@@ -165,44 +165,6 @@ def test_duplicate_symbol_rejected():
     assert "BTC" in reason or "already" in reason
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Rule 7b — aggregate portfolio-risk cap
-# ─────────────────────────────────────────────────────────────────────────────
-
-def test_portfolio_risk_cap_blocks_when_over_limit():
-    # One open position risking $350 (3500 notional × 10% stop) on a $1000
-    # account = 35% open risk; adding an 8% trade -> 43% > 40% cap.
-    existing = Position("p1", "i1", "AAA", True, 3500.0, 100.0, 10.0, _now())
-    state = _make_state(open_positions=[existing])
-    thesis = _make_thesis(symbol="BTC")
-    approved, reason = risk_gate.validate(
-        thesis, state, balance=1000.0, risk_pct=8.0
-    )
-    assert approved is False
-    assert "portfolio risk" in reason.lower()
-
-
-def test_portfolio_risk_cap_allows_when_under_limit():
-    # Open risk $200 (2000 × 10%) = 20%; + 8% trade = 28% < 40% cap -> allowed.
-    existing = Position("p1", "i1", "AAA", True, 2000.0, 100.0, 10.0, _now())
-    state = _make_state(open_positions=[existing])
-    thesis = _make_thesis(symbol="BTC")
-    approved, reason = risk_gate.validate(
-        thesis, state, balance=1000.0, risk_pct=8.0
-    )
-    assert approved is True
-
-
-def test_portfolio_risk_cap_skipped_when_risk_pct_none():
-    # Same over-limit open risk, but no risk_pct passed -> rule is skipped
-    # (backward compatibility for callers that don't supply it).
-    existing = Position("p1", "i1", "AAA", True, 9000.0, 100.0, 10.0, _now())
-    state = _make_state(open_positions=[existing])
-    thesis = _make_thesis(symbol="BTC")
-    approved, reason = risk_gate.validate(thesis, state, balance=1000.0)
-    assert approved is True
-
-
 def test_daily_loss_limit_exceeded_rejected():
     state = _make_state(daily_pnl=-310.0)  # -310 on 10000 = 3.1% > 3%
     thesis = _make_thesis()

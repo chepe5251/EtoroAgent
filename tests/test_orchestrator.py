@@ -64,7 +64,7 @@ async def test_execute_region_consumes_pending_signals():
          "pullback_resume": False, "score_tags": ["breakout"]}
     ]
     orch = _make_orchestrator(state)
-    orch._get_equity = AsyncMock(return_value=1000.0)
+    orch._get_balance = AsyncMock(return_value=1000.0)
     orch._unrealized_pnl = MagicMock(return_value=0.0)
     orch._build_and_execute = AsyncMock()
 

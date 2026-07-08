@@ -281,33 +281,16 @@ class EtoroClient:
         return data.get("clientPortfolio", {}) if isinstance(data, dict) else {}
 
     async def get_balance(self) -> float:
-        """Free/tradable USD cash (the portfolio `credit` field).
+        """Tradable USD balance.
 
         NOTE: GET /api/v1/balances requires the 'etoro-public:money.balance:read'
         scope, which is not grantable through the standard API Key Management UI
         (confirmed 403 InsufficientPermissions even with a fresh Read+Write real
         key). The portfolio endpoint's `credit` field ("Available trading balance
         in USD") is accessible with normal trade scopes and is used instead.
-
-        This is FREE CASH ONLY — it excludes margin tied up in open positions.
-        For risk sizing and the account drawdown hard stop use account EQUITY
-        instead (see get_account_capital() + Orchestrator._get_equity()).
         """
         client_portfolio = await self._get_client_portfolio()
         return float(client_portfolio.get("credit", 0))
-
-    async def get_account_capital(self) -> float:
-        """Total real capital at cost = free cash (`credit`) + Σ position margin
-        (`amount`, which equals initialAmountInDollars — margin invested at cost,
-        NOT marked to market, so adding it never double-counts unrealized P&L).
-
-        Mark-to-market EQUITY = this + unrealized P&L, which the caller adds
-        (Orchestrator._get_equity()) since it holds the live position marks.
-        """
-        cp = await self._get_client_portfolio()
-        credit = float(cp.get("credit", 0))
-        invested = sum(float(p.get("amount", 0) or 0) for p in cp.get("positions", []))
-        return credit + invested
 
     async def get_portfolio(self) -> list[dict]:
         """Returns positions normalised to {positionId, instrumentId, isBuy, openRate,

@@ -17,12 +17,6 @@ logger = logging.getLogger(__name__)
 
 _MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
 _DAILY_LOSS_LIMIT_PCT = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "3.0"))
-# Aggregate portfolio-risk cap: the summed money-at-risk of all open positions
-# (each = notional × stop-loss %) plus this trade's risk must stay under this
-# % of equity. Backstops the per-trade risk % against many concurrent
-# positions all firing on the same day (the backtest models each symbol with
-# independent capital, so it never constrained aggregate exposure).
-_MAX_PORTFOLIO_RISK_PCT = float(os.getenv("MAX_PORTFOLIO_RISK_PCT", "40.0"))
 _MIN_CONFIDENCE = float(os.getenv("MIN_SIGNAL_CONFIDENCE", "0.65"))
 _MIN_SIGNALS = int(os.getenv("MIN_SIGNALS_REQUIRED", "2"))
 _MIN_REASONING_LEN = 50
@@ -35,7 +29,6 @@ def validate(
     state: ProjectState,
     balance: float = 0.0,
     unrealized_pnl: float = 0.0,
-    risk_pct: float | None = None,
 ) -> tuple[bool, str]:
     """
     Validate a trading thesis against deterministic risk rules.
@@ -43,13 +36,7 @@ def validate(
     Args:
         thesis: The thesis produced by thesis_builder.build_thesis()
         state: Current system state (positions, P&L, block status)
-        balance: Account equity (mark-to-market), used as the base for the
-            daily-loss and aggregate-portfolio-risk checks.
-        unrealized_pnl: Open positions' unrealized P&L (for the proactive
-            daily-loss check).
-        risk_pct: The risk-per-trade % this trade will use (post drawdown
-            throttle). Required for the aggregate portfolio-risk rule; when
-            None, that rule is skipped (keeps older callers/tests working).
+        balance: Current available balance (used for daily loss % check)
 
     Returns:
         (allowed: bool, reason: str)
@@ -110,24 +97,6 @@ def validate(
     # Rule 7: no duplicate symbol
     if any(p.symbol == thesis.symbol for p in state.open_positions):
         return False, f"position already open for {thesis.symbol}"
-
-    # Rule 7b: aggregate portfolio risk cap. Sum the money-at-risk of every
-    # open position (notional × stop-loss %) and reject if adding this trade's
-    # risk would push total exposure past _MAX_PORTFOLIO_RISK_PCT of equity.
-    # Because state.open_positions grows as each trade in a batch is opened,
-    # this naturally throttles a large single-day batch — the missing
-    # portfolio-level guard the backtest never modeled.
-    if balance > 0 and risk_pct is not None:
-        open_risk = sum(
-            p.amount_usd * (p.stop_loss_pct / 100.0) for p in state.open_positions
-        )
-        open_risk_pct = open_risk / balance * 100.0
-        if open_risk_pct + risk_pct > _MAX_PORTFOLIO_RISK_PCT:
-            return (
-                False,
-                f"portfolio risk {open_risk_pct:.1f}% + this trade {risk_pct:.1f}% "
-                f"> cap {_MAX_PORTFOLIO_RISK_PCT:.0f}% of equity",
-            )
 
     # Rule 8: swing horizon must be in [5, 20] days
     if not (_SWING_MIN_HORIZON <= thesis.horizon_days <= _SWING_MAX_HORIZON):

@@ -267,16 +267,15 @@ class Orchestrator:
             logger.info("Execute %s: not a trading day — discarding pending signals", region)
             return
 
-        equity = await self._get_equity()
-        if equity <= 0:
-            logger.warning("Cannot fetch equity — skipping %s execution", region)
+        balance = await self._get_balance()
+        if balance <= 0:
+            logger.warning("Cannot fetch balance — skipping %s execution", region)
             return
 
-        # Account drawdown hard stop: throttles risk-per-trade back down if
-        # equity has fallen far enough below its all-time high — see
-        # ProjectState.effective_risk_pct(). Uses true mark-to-market equity,
-        # not free cash.
-        risk_pct = self.state.effective_risk_pct(_RISK_PER_TRADE_PCT, equity)
+        # Account drawdown hard stop: throttles risk-per-trade back down if the
+        # balance has fallen far enough below its all-time high — see
+        # ProjectState.effective_risk_pct().
+        risk_pct = self.state.effective_risk_pct(_RISK_PER_TRADE_PCT, balance)
         self.state.save()
 
         shortlist = [ScreeningResult(**d) for d in pending]
@@ -284,7 +283,7 @@ class Orchestrator:
 
         for result in shortlist:
             try:
-                await self._build_and_execute(result, equity, unrealized_pnl, risk_pct)
+                await self._build_and_execute(result, balance, unrealized_pnl, risk_pct)
             except Exception as exc:
                 logger.error("Error on %s: %s", result.symbol, exc, exc_info=True)
                 await self.notification_agent.send_critical_error(
@@ -307,7 +306,7 @@ class Orchestrator:
         symbol = thesis.symbol
 
         approved, reason = risk_gate_module.validate(
-            thesis, self.state, balance, unrealized_pnl=unrealized_pnl, risk_pct=risk_pct
+            thesis, self.state, balance, unrealized_pnl=unrealized_pnl
         )
         if not approved:
             logger.info("%s: rejected — %s", symbol, reason)
@@ -423,23 +422,6 @@ class Orchestrator:
         except Exception as exc:
             logger.error("get_balance failed: %s", exc)
             return 0.0
-
-    async def _get_equity(self) -> float:
-        """Mark-to-market account equity = capital at cost (free cash + Σ margin)
-        plus unrealized P&L on bot-tracked positions. Used as the account-size
-        base for position sizing, the daily-loss check, and the drawdown hard
-        stop — replacing free-cash `credit`, which fluctuates with how much
-        margin is deployed rather than with actual account value.
-
-        External (non-bot) positions are marked at cost — the bot only tracks
-        live rates for positions it opened.
-        """
-        try:
-            capital = await self.client.get_account_capital()
-        except Exception as exc:
-            logger.error("get_account_capital failed: %s", exc)
-            return 0.0
-        return capital + self._unrealized_pnl()
 
     def _unrealized_pnl(self) -> float:
         """Estimate unrealized P&L using cached current rates vs entry rates (P1-4)."""
