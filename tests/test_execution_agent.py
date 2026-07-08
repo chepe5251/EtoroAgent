@@ -133,6 +133,33 @@ def test_size_position_caps_at_leveraged_notional(monkeypatch):
     importlib.reload(ea)
 
 
+def test_size_position_risk_pct_override_takes_precedence(monkeypatch):
+    """The explicit risk_pct argument (set by the account drawdown hard stop
+    in orchestrator.py) must override the configured RISK_PER_TRADE_PCT."""
+    monkeypatch.setenv("RISK_PER_TRADE_PCT", "8.0")
+    monkeypatch.setenv("MAX_POSITION_SIZE_PCT", "300.0")  # cap high enough to not bind
+    monkeypatch.setenv("LEVERAGE", "1.0")
+    import importlib
+    import src.agents.execution_agent as ea
+    importlib.reload(ea)
+
+    thesis = _make_thesis(sl_atr_multiple=1.5)
+    atr = 2.0
+    stop_distance = 1.5 * atr
+
+    # No override -> uses the configured 8%.
+    order_default = ea.size_position(thesis, "42", balance=1000.0, current_price=100.0, atr=atr)
+    assert order_default.amount_usd == pytest.approx((1000.0 * 0.08 / stop_distance) * 100.0, abs=0.01)
+
+    # Override to 3% (simulating an active drawdown hard stop) -> smaller position.
+    order_reduced = ea.size_position(
+        thesis, "42", balance=1000.0, current_price=100.0, atr=atr, risk_pct=3.0
+    )
+    assert order_reduced.amount_usd == pytest.approx((1000.0 * 0.03 / stop_distance) * 100.0, abs=0.01)
+    assert order_reduced.amount_usd < order_default.amount_usd
+    importlib.reload(ea)
+
+
 @pytest.mark.asyncio
 async def test_execute_sends_margin_not_notional_to_broker(monkeypatch):
     """The broker order must receive amount=notional/leverage and the real

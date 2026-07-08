@@ -78,6 +78,7 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 _REGIONS = [r.strip().upper() for r in os.getenv("WATCH_REGIONS", "US,EU,ASIA,CRYPTO").split(",")]
+_RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "1.0"))
 
 
 def _utcnow() -> datetime:
@@ -271,12 +272,18 @@ class Orchestrator:
             logger.warning("Cannot fetch balance — skipping %s execution", region)
             return
 
+        # Account drawdown hard stop: throttles risk-per-trade back down if the
+        # balance has fallen far enough below its all-time high — see
+        # ProjectState.effective_risk_pct().
+        risk_pct = self.state.effective_risk_pct(_RISK_PER_TRADE_PCT, balance)
+        self.state.save()
+
         shortlist = [ScreeningResult(**d) for d in pending]
         unrealized_pnl = self._unrealized_pnl()
 
         for result in shortlist:
             try:
-                await self._build_and_execute(result, balance, unrealized_pnl)
+                await self._build_and_execute(result, balance, unrealized_pnl, risk_pct)
             except Exception as exc:
                 logger.error("Error on %s: %s", result.symbol, exc, exc_info=True)
                 await self.notification_agent.send_critical_error(
@@ -292,7 +299,8 @@ class Orchestrator:
         await self._execute_region(region)
 
     async def _build_and_execute(
-        self, result: ScreeningResult, balance: float, unrealized_pnl: float
+        self, result: ScreeningResult, balance: float, unrealized_pnl: float,
+        risk_pct: float | None = None,
     ):
         thesis = build_thesis(result)
         symbol = thesis.symbol
@@ -317,7 +325,7 @@ class Orchestrator:
         if current_price <= 0:
             logger.warning("%s: no valid price data — skipping execution", symbol)
             return
-        order = size_position(thesis, instrument_id, balance, current_price, atr)
+        order = size_position(thesis, instrument_id, balance, current_price, atr, risk_pct)
         logger.info(
             "%s: placing order amount=$%.2f stop=%.4f%% horizon=%dd",
             symbol, order.amount_usd, order.stop_loss_pct, thesis.horizon_days,

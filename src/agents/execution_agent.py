@@ -52,21 +52,26 @@ def size_position(
     balance: float,
     current_price: float,
     atr: float,
+    risk_pct: float | None = None,
 ) -> SizedOrder:
     """
     Risk-based position sizing — matches src/backtest/engine.py exactly:
       - Stop distance = suggested_stop_loss_atr_multiple × ATR
-      - risk_amount = balance × RISK_PER_TRADE_PCT%
+      - risk_amount = balance × risk_pct% (defaults to RISK_PER_TRADE_PCT; the
+        caller passes a reduced value when ProjectState.effective_risk_pct()
+        detects an account drawdown past the hard-stop threshold)
       - units = risk_amount / stop_distance ; notional = units × price
       - capped at MAX_POSITION_SIZE_PCT% × LEVERAGE of balance
     """
+    effective_risk_pct = risk_pct if risk_pct is not None else _RISK_PER_TRADE_PCT
+
     sl_distance = thesis.suggested_stop_loss_atr_multiple * atr if atr else current_price * 0.02
     stop_loss_pct = (sl_distance / current_price * 100) if current_price else 2.0
     stop_loss_pct = round(stop_loss_pct, 4)
 
     notional = 0.0
     if sl_distance > 0 and current_price > 0 and balance > 0:
-        risk_amount = balance * (_RISK_PER_TRADE_PCT / 100.0)
+        risk_amount = balance * (effective_risk_pct / 100.0)
         units = risk_amount / sl_distance
         notional = units * current_price
 

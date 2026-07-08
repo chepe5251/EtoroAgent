@@ -12,6 +12,16 @@ logger = logging.getLogger(__name__)
 
 _STATE_FILE = Path(__file__).parent.parent.parent / "state.json"
 
+# Account-level drawdown hard stop: if the balance falls this far below its
+# all-time high (tracked in ProjectState.peak_balance), position sizing drops
+# to a defensive risk-per-trade until the account recovers — protects the
+# capital base from compounding losses during a bad stretch. This is separate
+# from DAILY_LOSS_LIMIT_PCT (which blocks new trades for the rest of the day):
+# this tracks drawdown from the peak over any timeframe, and only throttles
+# risk sizing rather than halting trading outright.
+_ACCOUNT_DRAWDOWN_HARD_STOP_PCT = float(os.getenv("ACCOUNT_DRAWDOWN_HARD_STOP_PCT", "10.0"))
+_REDUCED_RISK_PCT = float(os.getenv("REDUCED_RISK_PCT", "3.0"))
+
 
 def get_hard_exit_days() -> int:
     return int(os.getenv("SWING_HARD_EXIT_DAYS", "20"))
@@ -100,6 +110,36 @@ class ProjectState:
         # Screening results scanned pre-market, executed once the region's
         # market actually opens — see Orchestrator._scan_region/_execute_region.
         self.pending_signals: dict[str, list[dict]] = {}
+        # All-time-high balance observed — used for the account drawdown hard stop.
+        self.peak_balance: float = 0.0
+
+    def update_peak_balance(self, balance: float) -> float:
+        """
+        Update the all-time-high balance and return the current drawdown %
+        from that peak (0 if balance is at or above the peak).
+        """
+        if balance > self.peak_balance:
+            self.peak_balance = balance
+        if self.peak_balance <= 0:
+            return 0.0
+        return max(0.0, (self.peak_balance - balance) / self.peak_balance * 100.0)
+
+    def effective_risk_pct(self, configured_pct: float, balance: float) -> float:
+        """
+        Risk-per-trade to actually use for sizing: the configured value, unless
+        the account has drawn down _ACCOUNT_DRAWDOWN_HARD_STOP_PCT or more from
+        its peak balance, in which case it drops to _REDUCED_RISK_PCT until the
+        account recovers.
+        """
+        drawdown_pct = self.update_peak_balance(balance)
+        if drawdown_pct >= _ACCOUNT_DRAWDOWN_HARD_STOP_PCT:
+            logger.warning(
+                "Account drawdown %.2f%% >= hard-stop threshold %.1f%% — "
+                "reducing risk-per-trade to %.1f%% (configured: %.1f%%)",
+                drawdown_pct, _ACCOUNT_DRAWDOWN_HARD_STOP_PCT, _REDUCED_RISK_PCT, configured_pct,
+            )
+            return _REDUCED_RISK_PCT
+        return configured_pct
 
     def reset_daily_if_needed(self) -> bool:
         today = _utcnow().date().isoformat()
@@ -138,6 +178,7 @@ class ProjectState:
             "risk_block_reason": self.risk_block_reason,
             "_daily_reset_date": self._daily_reset_date,
             "pending_signals": self.pending_signals,
+            "peak_balance": self.peak_balance,
             "saved_at": _utcnow().isoformat(),
         }
         try:
@@ -164,6 +205,7 @@ class ProjectState:
                 data.get("_daily_reset_date", _utcnow().date().isoformat())
             )
             state.pending_signals = dict(data.get("pending_signals", {}))
+            state.peak_balance = float(data.get("peak_balance", 0.0))
             logger.info(
                 "State loaded from %s: %d open positions, daily_pnl=%.2f",
                 target, len(state.open_positions), state.daily_pnl,
